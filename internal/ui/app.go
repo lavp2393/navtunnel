@@ -3,6 +3,7 @@ package ui
 import (
 	"errors"
 	"fmt"
+	"sync"
 
 	"github.com/prey/preyvpn/internal/core"
 	"github.com/prey/preyvpn/internal/logs"
@@ -30,6 +31,9 @@ type App struct {
 	window    fyne.Window
 	state     AppState
 	logBuffer *logs.Buffer
+
+	// Thread-safety for state
+	stateMutex sync.RWMutex
 
 	// UI elements
 	statusLabel   *widget.Label
@@ -211,6 +215,8 @@ func (a *App) onConnect() {
 // onDisconnect maneja el evento de desconectar
 func (a *App) onDisconnect() {
 	a.addLog("Desconectando...")
+	// Set state immediately to prevent race conditions in callbacks
+	a.setState(StateDisconnected)
 
 	// El manager se encarga de matar el proceso OpenVPN cuando se llama Stop()
 	if a.manager != nil {
@@ -219,7 +225,6 @@ func (a *App) onDisconnect() {
 		a.manager = nil
 	}
 
-	a.setState(StateDisconnected)
 	a.connectBtn.Enable()
 	a.disconnectBtn.Disable()
 }
@@ -234,6 +239,9 @@ func (a *App) handleEvents() {
 		case core.EventAskUser:
 			a.setState(StateAuthenticating)
 			ShowUsernamePromptWithRemember(a.window, a.savedUsername, a.rememberCreds, func(result PromptResult) {
+				if a.getState() != StateAuthenticating {
+					return // Abort if state changed (e.g., disconnected)
+				}
 				a.savedUsername = result.Value
 				a.rememberCreds = result.Remember
 
@@ -245,11 +253,12 @@ func (a *App) handleEvents() {
 
 		case core.EventAskPass:
 			a.setState(StateAuthenticating)
-			// Usar prompt con valor por defecto pero sin checkbox (la decisión ya se tomó en el modal de usuario)
 			ShowPasswordPromptWithDefault(a.window, a.savedPassword, func(password string) {
+				if a.getState() != StateAuthenticating {
+					return // Abort if state changed
+				}
 				a.savedPassword = password
 
-				// Guardar o eliminar credenciales según la decisión tomada en el modal de usuario
 				if a.rememberCreds {
 					method, warning, err := core.SaveCredentials(a.savedUsername, a.savedPassword)
 					if err != nil {
@@ -262,7 +271,6 @@ func (a *App) handleEvents() {
 						}
 					}
 				} else {
-					// Usuario no marcó recordar, eliminar credenciales guardadas si existían
 					if err := core.DeleteCredentials(); err != nil {
 						a.addLog("Advertencia: No se pudieron eliminar credenciales guardadas: " + err.Error())
 					}
@@ -271,7 +279,6 @@ func (a *App) handleEvents() {
 					a.credStore = core.CredentialStoreMethodNone
 				}
 
-				// Enviar password a OpenVPN
 				if err := a.sendFns.Password(password); err != nil {
 					a.addLog("Error al enviar contraseña: " + err.Error())
 				}
@@ -280,6 +287,9 @@ func (a *App) handleEvents() {
 		case core.EventAskOTP:
 			a.setState(StateAuthenticating)
 			ShowOTPPrompt(a.window, func(otp string) {
+				if a.getState() != StateAuthenticating {
+					return // Abort if state changed
+				}
 				if err := a.sendFns.OTP(otp); err != nil {
 					a.addLog("Error al enviar OTP: " + err.Error())
 				}
@@ -295,32 +305,27 @@ func (a *App) handleEvents() {
 			a.addLog("Error: " + event.Message)
 			ShowError(a.window, "Error de autenticación", event.Message)
 
-			// Re-pedir solo el campo que falló
 			if event.Stage == "password" {
-				// Re-pedir password sin checkbox (usa la decisión ya tomada)
 				ShowPasswordPromptWithDefault(a.window, a.savedPassword, func(password string) {
+					if a.getState() != StateAuthenticating {
+						return // Abort if state changed
+					}
 					a.savedPassword = password
-
-					// Actualizar credenciales guardadas si estaba marcado recordar
 					if a.rememberCreds {
-						method, warning, err := core.SaveCredentials(a.savedUsername, a.savedPassword)
-						if err != nil {
-							a.addLog("Advertencia: No se pudieron guardar las credenciales: " + err.Error())
-						} else {
-							a.credStore = method
-							a.logCredentialSave(method)
-							if warning != "" {
-								a.addLog("Aviso: " + warning)
-							}
+						// Re-save credentials on failure if remember is checked
+						if _, _, err := core.SaveCredentials(a.savedUsername, a.savedPassword); err != nil {
+							a.addLog("Advertencia: No se pudieron actualizar las credenciales: " + err.Error())
 						}
 					}
-
 					if err := a.sendFns.Password(password); err != nil {
 						a.addLog("Error al enviar contraseña: " + err.Error())
 					}
 				})
 			} else if event.Stage == "otp" {
 				ShowOTPPrompt(a.window, func(otp string) {
+					if a.getState() != StateAuthenticating {
+						return // Abort if state changed
+					}
 					if err := a.sendFns.OTP(otp); err != nil {
 						a.addLog("Error al enviar OTP: " + err.Error())
 					}
@@ -340,9 +345,18 @@ func (a *App) handleEvents() {
 	}
 }
 
-// setState actualiza el estado de la aplicación
+// getState de forma segura para hilos
+func (a *App) getState() AppState {
+	a.stateMutex.RLock()
+	defer a.stateMutex.RUnlock()
+	return a.state
+}
+
+// setState actualiza el estado de la aplicación de forma segura para hilos
 func (a *App) setState(state AppState) {
+	a.stateMutex.Lock()
 	a.state = state
+	a.stateMutex.Unlock()
 
 	switch state {
 	case StateDisconnected:
@@ -356,6 +370,7 @@ func (a *App) setState(state AppState) {
 	case StateError:
 		a.statusLabel.SetText("Estado: Error ❌")
 	}
+	a.statusLabel.Refresh()
 }
 
 // addLog agrega una línea al buffer de logs y actualiza la UI
@@ -364,7 +379,10 @@ func (a *App) addLog(line string) {
 	a.logView.SetText(a.logBuffer.GetText())
 
 	// Auto-scroll al final
-	a.logView.CursorRow = len(a.logBuffer.GetAll())
+	if a.logView.Visible() {
+		a.logView.CursorRow = len(a.logBuffer.GetAll())
+	}
+	a.logView.Refresh()
 }
 
 func (a *App) logCredentialSave(method core.CredentialStoreMethod) {

@@ -1,5 +1,7 @@
 # PreyVPN - Cliente OpenVPN con GUI Multi-Plataforma
 
+**Version 1.0.0 - Stable Release (Linux/Ubuntu - 2025-11-07)**
+
 Cliente OpenVPN con interfaz gráfica que facilita la conexión a la VPN corporativa mediante autenticación multi-factor (usuario + contraseña + OTP).
 
 ## Estado del Proyecto

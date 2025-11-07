@@ -231,7 +231,7 @@ func (m *Manager) readPTY() {
 					if strings.Contains(incomplete, "Enter Auth Username:") ||
 						strings.Contains(incomplete, "Enter Auth Password:") ||
 						strings.Contains(incomplete, "CHALLENGE:") ||
-						strings.Contains(incomplete, "Response:") {
+						strings.HasSuffix(incomplete, "Response:") {
 						m.events <- Event{
 							Type:    EventLogLine,
 							Message: incomplete,

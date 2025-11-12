@@ -1,11 +1,13 @@
-# PreyVPN Wrapper — Especificación MVP (Ubuntu, sin .deb)
+# PreyVPN — Especificación MVP v1.0 (Ubuntu, con .deb) ✅ COMPLETO
 
 ## 1) Objetivo
-Binario **Go** con GUI mínima que:
-- Lanza **OpenVPN** usando un perfil fijo.
-- Gestiona prompts **usuario → contraseña → OTP** vía **Management Interface**.
-- Permite **Conectar/Desconectar** sin terminal.
-- **No** cambia nada del backend (OpenVPN + PAM/LDAP + LinOTP).
+Binario **Go** con GUI completa diseñada para usuarios no técnicos que:
+- Lanza **OpenVPN** usando cualquier perfil .ovpn seleccionado visualmente
+- Gestiona prompts **usuario → contraseña → OTP** vía **Management Interface**
+- Permite **Conectar/Desconectar** 100% desde GUI (cero terminal)
+- Incluye **system tray** con iconos de estado
+- Se instala con **.deb** que configura dependencias y permisos automáticamente
+- **No** cambia nada del backend (OpenVPN + PAM/LDAP + LinOTP)
 
 ---
 
@@ -17,13 +19,19 @@ Binario **Go** con GUI mínima que:
 
 ---
 
-## 3) Perfil VPN (ubicación fija)
-- Carpeta: `~/PreyVPN/`
-- Archivo: **`prey-prod.ovpn`**
-- Ruta esperada: `~/PreyVPN/prey-prod.ovpn`
+## 3) Perfil VPN (✅ ACTUALIZADO: File Picker Visual)
+- **YA NO usa ruta fija** - el usuario selecciona el archivo visualmente
+- Al primer inicio: aparece **diálogo de bienvenida** con botón "Seleccionar Archivo VPN"
+- Se abre un **file picker visual** que filtra archivos `.ovpn`
+- El usuario navega y selecciona cualquier archivo `.ovpn` (sin importar el nombre o ubicación)
+- La ruta seleccionada se guarda en: `~/.config/PreyVPN/config.json`
 
-**Regla:** El binario busca **solo** esa ruta.  
-Si no existe, muestra una pantalla con instrucción y botón **Reintentar**.
+**Beneficios:**
+- ✅ 100% visual, no requiere terminal
+- ✅ Funciona con cualquier archivo .ovpn
+- ✅ No necesita renombrar archivos
+- ✅ Configuración persistente entre sesiones
+- ✅ Botón "Cambiar archivo VPN" para seleccionar otro perfil
 
 ---
 
@@ -32,7 +40,7 @@ Si no existe, muestra una pantalla con instrucción y botón **Reintentar**.
 ### 4.1 Ciclo básico
 1. **Inicio**
    - Verifica existencia de `~/PreyVPN/prey-prod.ovpn`.
-   - Si no está: pantalla “perfil no encontrado” + **Reintentar**.
+   - Si no está: pantalla "perfil no encontrado" + **Reintentar**.
    - Si está: habilita **Conectar**.
 
 2. **Conectar**
@@ -65,20 +73,47 @@ Si no existe, muestra una pantalla con instrucción y botón **Reintentar**.
 
 ---
 
-## 5) UI mínima (sin imponer toolkit)
-- **Ventana principal**
-  - Estado: “Perfil detectado / Perfil no encontrado”
-  - Botones: **Conectar / Desconectar**, **Reintentar** (solo si falta el perfil)
-  - Log en vivo (últimas ~30 líneas; solo lectura)
-- **Modales**
-  - Usuario (placeholder: “usuario corporativo”)
-  - Contraseña
-  - OTP (6 dígitos; hint: “se renueva cada 30s”)
-- **Mensajes**
-  - Perfil no encontrado: `No encuentro ~/PreyVPN/prey-prod.ovpn. Coloca el archivo allí y presiona Reintentar.`
+## 5) UI Completa (✅ IMPLEMENTADO con Fyne)
+### **Ventana principal**
+  - Estado: "Conectado / Desconectado / Conectando..."
+  - Indicador visual del archivo .ovpn configurado
+  - Botones:
+    - **Conectar / Desconectar**
+    - **Cambiar archivo VPN** (abre file picker)
+  - Log en vivo (buffer circular de últimas ~100 líneas; solo lectura)
+  - **Minimizar a tray:** cerrar la ventana NO cierra la app, la minimiza al system tray
+
+### **System Tray** ⭐ NUEVO
+  - **Icono persistente** en la barra del sistema
+  - **Estados visuales:**
+    - 🔘 Gris: Desconectado
+    - 🟠 Naranja: Conectando/Autenticando
+    - 🟢 Verde: Conectado
+    - 🔴 Rojo: Error
+  - **Menú contextual** (clic derecho):
+    - Estado actual
+    - Conectar / Desconectar
+    - Mostrar ventana
+    - Salir (cierra completamente)
+  - Implementado con abstracción (`internal/tray/`) que permite migrar a AppIndicator3 nativo
+
+### **File Picker Visual** ⭐ NUEVO
+  - Diálogo nativo de Fyne
+  - Filtro automático para archivos `.ovpn`
+  - Navegar por todo el sistema de archivos
+  - Guarda la selección en `~/.config/PreyVPN/config.json`
+
+### **Modales de Autenticación**
+  - Usuario (placeholder: "usuario corporativo")
+  - Contraseña (campo oculto)
+  - OTP (6 dígitos; hint: "se renueva cada 30s")
+
+### **Mensajes**
+  - Archivo no configurado: "Selecciona tu archivo .ovpn para comenzar"
   - Contraseña incorrecta: `Contraseña incorrecta.`
   - OTP inválido/expirado: `OTP inválido o expirado.`
   - Conectado: `Conexión establecida ✅`
+  - System tray: `Minimizado a la bandeja del sistema`
 
 ---
 
@@ -90,21 +125,49 @@ Si no existe, muestra una pantalla con instrucción y botón **Reintentar**.
 
 ---
 
-## 7) Estructura de proyecto (sugerida)
+## 7) Estructura de proyecto (✅ IMPLEMENTADA)
 
 ```
-/cmd/preyvpn/main.go
-/internal/core/openvpn.go        // spawn/kill de proceso con pkexec; resolución de ruta openvpn
-/internal/core/manager.go        // socket mgmt + parser + FSM (estados y eventos)
-/internal/ui/app.go              // ventana principal, estados, log view
-/internal/ui/prompts.go          // modales user/pass/otp
-/internal/logs/buffer.go         // buffer de log (rotación en memoria)
+/cmd/preyvpn/main.go                    # Punto de entrada
+/internal/
+  /core/
+    openvpn.go                          # spawn/kill de proceso con pkexec; usa platform abstraction
+    manager.go                          # socket mgmt + parser + FSM (estados y eventos)
+  /platform/                            # ⭐ Abstracciones multi-plataforma
+    platform.go                         # Interface común
+    platform_linux.go                   # Implementación Linux completa
+    platform_windows.go                 # Stub (futuro)
+    platform_darwin.go                  # Stub (futuro)
+  /tray/                                # ⭐ System tray abstraction (NUEVO)
+    tray.go                             # Interface TrayIcon común
+    systray.go                          # Implementación con getlantern/systray
+    /icons/                             # Iconos PNG de estado
+      generate_icons.py
+      disconnected.png, connecting.png, connected.png, error.png
+  /config/                              # ⭐ Configuración persistente (NUEVO)
+    config.go                           # Gestión de config.json en ~/.config/PreyVPN/
+  /ui/
+    app.go                              # ventana principal, file picker, system tray integration
+    prompts.go                          # modales user/pass/otp
+  /logs/
+    buffer.go                           # buffer de log (rotación en memoria)
+/packaging/                             # ⭐ Packaging .deb (NUEVO)
+  build-deb.sh                          # Script de construcción del paquete
+  create-icon.py                        # Generador de icono de la app
+  /debian/
+    /DEBIAN/
+      control                           # Metadata y dependencias
+      postinst                          # Configura /etc/sudoers.d/preyvpn
+      prerm                             # Limpieza
+    /usr/...                            # Estructura del paquete
 ```
 
-**Contratos recomendados**
+**Contratos implementados:**
 - `core.Start(configPath string, mgmtPort int) (events <-chan Event, send SendFns, stop func(), err error)`
 - `type Event = AskUser | AskPass | AskOTP | Connected | AuthFailed{stage} | Fatal{reason} | LogLine{text}`
 - `type SendFns struct { Username(v string); Password(v string); OTP(v string) }`
+- `tray.TrayIcon` interface para abstracción del system tray
+- `config.Config` struct para persistencia de configuración
 
 ---
 
@@ -160,28 +223,89 @@ password "Auth" 123456        // o como 'password' adicional, según prompt
 
 ---
 
-## 11) Criterios de aceptación (QA)
-1. Con `~/PreyVPN/prey-prod.ovpn` presente:
-   - **Conectar** → aparecen **3 prompts** (usuario → contraseña → OTP) y termina en **Conectado**.
-2. Error de contraseña:
-   - Muestra mensaje y re-pide **solo** contraseña.
-3. Error de OTP:
-   - Muestra mensaje y re-pide **solo** OTP.
-4. **Desconectar**:
-   - Mata el proceso OpenVPN y vuelve a estado inicial sin residuos.
-5. `--auth-nocache`:
-   - Confirmado en las líneas de arranque del log.
-6. Logs:
-   - Sin secretos; visor en UI muestra ~30 últimas líneas.
+## 11) Criterios de aceptación (✅ TODOS CUMPLIDOS)
+1. ✅ **Instalación con .deb:**
+   - Instala todas las dependencias automáticamente
+   - Configura permisos sudo sin intervención del usuario
+   - Crea entrada en menú de aplicaciones
+   - Instalable con un solo comando: `sudo dpkg -i preyvpn_1.0.0_amd64.deb`
+
+2. ✅ **File Picker Visual:**
+   - Al primer inicio, aparece diálogo de bienvenida
+   - File picker filtra archivos `.ovpn` automáticamente
+   - Guarda la selección en `~/.config/PreyVPN/config.json`
+   - Botón "Cambiar archivo VPN" funciona correctamente
+
+3. ✅ **Autenticación multi-factor:**
+   - **Conectar** → aparecen **3 prompts** (usuario → contraseña → OTP) y termina en **Conectado**
+   - Error de contraseña: muestra mensaje y re-pide **solo** contraseña
+   - Error de OTP: muestra mensaje y re-pide **solo** OTP
+
+4. ✅ **System Tray:**
+   - Icono aparece en la barra del sistema
+   - Cambia de color según estado (gris/naranja/verde/rojo)
+   - Menú contextual con Connect/Disconnect/Show/Quit
+   - Minimizar ventana → va al tray (no cierra la app)
+
+5. ✅ **Desconectar:**
+   - Mata el proceso OpenVPN limpiamente
+   - Vuelve a estado inicial sin residuos
+
+6. ✅ **Seguridad:**
+   - `--auth-nocache` confirmado en logs de arranque
+   - Logs sin secretos (no imprimen credenciales ni OTP)
+   - Configuración sudo limitada solo a openvpn
+
+7. ✅ **Experiencia de usuario:**
+   - Cero uso de terminal requerido
+   - No necesita editar archivos de configuración manualmente
+   - Funciona sin sudo (permisos configurados automáticamente)
 
 ---
 
-## 12) Backlog (fuera de este MVP)
-- Recordar usuario (keyring).
-- Soporte de múltiples perfiles en `~/PreyVPN/`.
-- Auto-reconexión con backoff.
-- Regla polkit por grupo (sin prompt).
-- Builds Windows/macOS.
+## 12) Características Completadas (v1.0)
+- ✅ Arquitectura multi-plataforma con abstracciones
+- ✅ Implementación completa para Linux/Ubuntu
+- ✅ System tray con iconos de estado y menú contextual
+- ✅ File picker visual (Fyne)
+- ✅ Configuración persistente en `~/.config/PreyVPN/config.json`
+- ✅ Packaging .deb con postinst/prerm scripts
+- ✅ Desktop entry y menú de aplicaciones
+- ✅ Multi-factor authentication (usuario + password + OTP)
+- ✅ Minimizar a tray
+- ✅ Abstracción del system tray (preparada para AppIndicator3)
+
+---
+
+## 13) Backlog (Próximas Versiones)
+
+### v1.1 - System Tray Nativo
+- [ ] Implementar `internal/tray/appindicator.go` con AppIndicator3 nativo (CGo)
+- [ ] Mejor integración con GNOME Shell
+- [ ] Notificaciones nativas del sistema
+- [ ] Variable de entorno para elegir implementación
+
+### v1.2 - Windows Support
+- [ ] Implementar `internal/platform/windows/` completo
+- [ ] System tray nativo de Windows
+- [ ] Elevación con UAC
+- [ ] Instalador .msi con WiX
+
+### v1.3 - macOS Support
+- [ ] Implementar `internal/platform/darwin/` completo
+- [ ] System tray con NSStatusBar
+- [ ] Elevación con osascript/SMJobBless
+- [ ] Bundle .app y .dmg
+- [ ] Firmar para Gatekeeper
+
+### v2.0 - Features Avanzadas
+- [ ] Recordar usuario con keyring/Credential Manager/Keychain
+- [ ] Soporte de múltiples perfiles VPN con selector visual
+- [ ] Auto-reconexión con backoff exponencial
+- [ ] Regla polkit por grupo (sin prompt de password)
+- [ ] Auto-update system
+- [ ] Logging configurable con niveles
+- [ ] Estadísticas de uso (tiempo conectado, datos)
 
 ---
 

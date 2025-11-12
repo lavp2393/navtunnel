@@ -1,0 +1,13 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=PreyVPN
+GenericName=VPN Client
+Comment=Cliente OpenVPN con autenticación multi-factor
+Icon=preyvpn
+Exec=/usr/bin/preyvpn
+Terminal=false
+Categories=Network;
+Keywords=vpn;openvpn;network;security;
+StartupNotify=true
+StartupWMClass=PreyVPN

@@ -10,6 +10,13 @@ bin/
 dist/
 build/
 
+# Paquetes de distribución
+*.deb
+*.rpm
+*.pkg
+*.dmg
+*.msi
+
 # Dependencias de Go
 vendor/
 
@@ -42,3 +49,19 @@ tmp/
 
 # Air (hot-reload)
 build-errors.log
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.Python
+venv/
+env/
+
+# Configuración local de usuario
+.config/PreyVPN/
+config.json
+
+# Archivos temporales de empaquetado
+packaging/debian/usr/bin/preyvpn

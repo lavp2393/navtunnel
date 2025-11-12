@@ -1,12 +1,12 @@
-# Guía de Compilación - PreyVPN
+# Guía de Compilación y Packaging - PreyVPN
 
-Esta guía explica cómo compilar PreyVPN **sin necesidad de instalar Go ni dependencias** en tu máquina.
+Esta guía explica cómo compilar PreyVPN y crear el paquete .deb **sin necesidad de instalar Go ni dependencias** en tu máquina.
 
 ## 🎯 Compilación con Docker (Recomendado)
 
 **Ventajas:**
 - ✅ NO requiere instalar Go
-- ✅ NO requiere instalar dependencias de Fyne (libgl, xorg-dev, etc.)
+- ✅ NO requiere instalar dependencias de Fyne (libgl, xorg-dev, libayatana-appindicator3-dev, etc.)
 - ✅ Entorno reproducible
 - ✅ Funciona en cualquier máquina con Docker
 
@@ -266,4 +266,206 @@ docker build --no-cache -f Dockerfile.build -t preyvpn-builder --target builder 
 
 ---
 
-**¿Más preguntas?** Consulta [DOCKER-README.md](DOCKER-README.md) o abre un issue.
+## 📦 Creación del Paquete .deb
+
+### Requisitos
+
+- Binario compilado en `dist/preyvpn`
+- Python 3 con PIL (Pillow) para generar el icono
+- `dpkg-deb` (viene instalado en Ubuntu/Debian)
+- Opcionalmente: `fakeroot` (recomendado)
+
+### Paso 1: Compilar el binario
+
+```bash
+# Con Docker (recomendado)
+./dev.sh build-binary
+# O
+task build-docker
+
+# El binario estará en dist/preyvpn
+ls -lh dist/preyvpn
+```
+
+### Paso 2: Generar el icono de la aplicación
+
+```bash
+# Instalar dependencias de Python (solo primera vez)
+pip3 install Pillow
+
+# Generar el icono
+cd packaging
+python3 create-icon.py
+
+# Verificar que se creó
+ls -lh debian/usr/share/icons/hicolor/256x256/apps/preyvpn.png
+cd ..
+```
+
+**Nota:** El script `create-icon.py` genera un icono simple con una "V" estilizada en un círculo verde. Puedes reemplazarlo con tu propio icono PNG de 256x256.
+
+### Paso 3: Construir el paquete .deb
+
+```bash
+cd packaging
+./build-deb.sh
+
+# El paquete se creará en dist/
+ls -lh ../dist/preyvpn_1.0.0_amd64.deb
+```
+
+### Proceso completo en un solo comando
+
+```bash
+# Compilar binario
+./dev.sh build-binary
+
+# Crear icono (si no existe)
+cd packaging && python3 create-icon.py && cd ..
+
+# Construir .deb
+cd packaging && ./build-deb.sh && cd ..
+
+# ¡Listo! El paquete está en dist/preyvpn_1.0.0_amd64.deb
+```
+
+### Verificar el paquete
+
+```bash
+# Ver información del paquete
+dpkg-deb --info dist/preyvpn_1.0.0_amd64.deb
+
+# Ver contenido del paquete
+dpkg-deb --contents dist/preyvpn_1.0.0_amd64.deb
+
+# Verificar dependencias
+dpkg-deb --field dist/preyvpn_1.0.0_amd64.deb Depends
+```
+
+### Probar la instalación
+
+```bash
+# Instalar el paquete
+sudo dpkg -i dist/preyvpn_1.0.0_amd64.deb
+
+# Si hay errores de dependencias
+sudo apt-get install -f
+
+# Verificar que se instaló
+which preyvpn
+dpkg -l | grep preyvpn
+
+# Ejecutar desde el menú de aplicaciones
+# O desde terminal:
+preyvpn
+
+# Desinstalar (si quieres)
+sudo apt remove preyvpn
+```
+
+---
+
+## 📋 Estructura del Paquete .deb
+
+El script `packaging/build-deb.sh` crea la siguiente estructura:
+
+```
+packaging/debian/
+├── DEBIAN/
+│   ├── control                # Metadata del paquete y dependencias
+│   ├── postinst               # Script que se ejecuta después de instalar
+│   └── prerm                  # Script que se ejecuta antes de desinstalar
+├── usr/
+│   ├── bin/
+│   │   └── preyvpn           # Binario copiado de dist/
+│   └── share/
+│       ├── applications/
+│       │   └── preyvpn.desktop  # Entrada en el menú de aplicaciones
+│       └── icons/hicolor/256x256/apps/
+│           └── preyvpn.png      # Icono de la aplicación
+```
+
+### Archivos importantes
+
+#### control
+Define el paquete y sus dependencias:
+```
+Package: preyvpn
+Version: 1.0.0
+Architecture: amd64
+Depends: openvpn, policykit-1, libgl1, libayatana-appindicator3-1, ...
+```
+
+#### postinst
+Configura `/etc/sudoers.d/preyvpn` para que **todos los usuarios** puedan ejecutar openvpn sin password:
+```bash
+echo "ALL ALL=(ALL) NOPASSWD: /usr/sbin/openvpn" > /etc/sudoers.d/preyvpn
+chmod 0440 /etc/sudoers.d/preyvpn
+```
+
+#### prerm
+Limpia la configuración de sudo al desinstalar:
+```bash
+rm -f /etc/sudoers.d/preyvpn
+```
+
+---
+
+## 🔧 Personalizar el paquete
+
+### Cambiar la versión
+
+Edita estos archivos:
+- `packaging/debian/DEBIAN/control` - línea `Version:`
+- `packaging/build-deb.sh` - variable `PACKAGE_NAME`
+
+### Cambiar dependencias
+
+Edita `packaging/debian/DEBIAN/control` - línea `Depends:`
+
+### Cambiar el icono
+
+Reemplaza `packaging/debian/usr/share/icons/hicolor/256x256/apps/preyvpn.png` con tu propio icono PNG de 256x256.
+
+### Agregar más archivos
+
+Agrega archivos en `packaging/debian/usr/` siguiendo la estructura de directorios de Linux.
+
+Por ejemplo, para agregar documentación:
+```bash
+mkdir -p packaging/debian/usr/share/doc/preyvpn
+cp README.md packaging/debian/usr/share/doc/preyvpn/
+```
+
+---
+
+## 🚨 Troubleshooting del Packaging
+
+### Error: "control file must have a newline at end"
+Asegúrate de que `packaging/debian/DEBIAN/control` tenga una línea vacía al final.
+
+### Error: "cannot stat 'dist/preyvpn': No such file or directory"
+Compila el binario primero con `./dev.sh build-binary`
+
+### Error: "Installed-Size appears twice"
+El script `build-deb.sh` calcula automáticamente el tamaño. No modifiques el control manualmente durante el build.
+
+### El paquete no instala las dependencias
+Usa `sudo apt-get install -f` después de instalar con dpkg.
+
+### Los permisos no funcionan después de instalar
+Verifica que el script postinst se ejecutó:
+```bash
+cat /etc/sudoers.d/preyvpn
+# Debería mostrar: ALL ALL=(ALL) NOPASSWD: /usr/sbin/openvpn
+```
+
+Si no existe, reinstala:
+```bash
+sudo apt remove preyvpn
+sudo dpkg -i dist/preyvpn_1.0.0_amd64.deb
+```
+
+---
+
+**¿Más preguntas?** Consulta [DOCKER-README.md](DOCKER-README.md) o [ARCHITECTURE.md](ARCHITECTURE.md) para más detalles.

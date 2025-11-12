@@ -1,8 +1,8 @@
 # PreyVPN - Cliente OpenVPN con GUI Multi-Plataforma
 
-**Version 1.0.0 - Stable Release (Linux/Ubuntu - 2025-11-07)**
+**Version 1.0.0 - Stable Release (Linux/Ubuntu - 2025-11-11)**
 
-Cliente OpenVPN con interfaz gráfica que facilita la conexión a la VPN corporativa mediante autenticación multi-factor (usuario + contraseña + OTP).
+Cliente OpenVPN con interfaz gráfica diseñado para usuarios no técnicos, que facilita la conexión a la VPN corporativa mediante autenticación multi-factor (usuario + contraseña + OTP).
 
 ## Estado del Proyecto
 
@@ -16,7 +16,14 @@ Cliente OpenVPN con interfaz gráfica que facilita la conexión a la VPN corpora
 
 ## Características
 
-- **Interfaz gráfica simple**: Sin necesidad de usar la terminal
+- **100% sin terminal**: Diseñado para usuarios no técnicos
+- **File picker visual**: Selección gráfica del archivo .ovpn
+- **System tray integration**: Icono persistente en la barra del sistema
+  - Estados visuales: Desconectado (gris), Conectando (naranja), Conectado (verde), Error (rojo)
+  - Menú contextual con Connect/Disconnect/Show/Quit
+  - Minimizar a tray en lugar de cerrar
+- **Configuración persistente**: Recuerda el archivo .ovpn seleccionado
+- **Instalación con .deb**: Configura permisos automáticamente (no más sudo)
 - **Autenticación multi-factor**: Usuario → Contraseña → OTP (LinOTP)
 - **Gestión automática**: Maneja toda la comunicación con OpenVPN
 - **Logs en vivo**: Visualización de eventos de conexión
@@ -28,34 +35,40 @@ Cliente OpenVPN con interfaz gráfica que facilita la conexión a la VPN corpora
 - Ubuntu Desktop 20.04 o superior
 - Otras distribuciones basadas en Debian (pueden funcionar)
 
-### Dependencias
+### Dependencias (si usas el .deb, se instalan automáticamente)
 
-1. **OpenVPN**
-   ```bash
-   sudo apt install openvpn
-   ```
+- **OpenVPN**: Cliente VPN
+- **PolicyKit**: Elevación de privilegios
+- **Librerías GUI**: GTK3, Cairo, sistema de notificaciones
+- **System Tray**: libayatana-appindicator3
 
-2. **PolicyKit** (para elevación de privilegios)
-   ```bash
-   sudo apt install policykit-1
-   ```
-
-3. **Go 1.21+** (solo para compilar)
-   ```bash
-   # Descargar desde https://golang.org/dl/
-   wget https://go.dev/dl/go1.21.0.linux-amd64.tar.gz
-   sudo tar -C /usr/local -xzf go1.21.0.linux-amd64.tar.gz
-   export PATH=$PATH:/usr/local/go/bin
-   ```
-
-4. **Dependencias de GUI** (para Fyne)
-   ```bash
-   sudo apt install libgl1-mesa-dev xorg-dev
-   ```
+Si instalas desde el paquete .deb, **todas las dependencias se instalan automáticamente**.
 
 ## Instalación
 
-### Opción 1: Compilar con Docker (Recomendado - NO requiere Go instalado)
+### Opción 1: Instalación con paquete .deb (Recomendado para usuarios finales)
+
+**La forma más fácil** - un solo comando que instala todo:
+
+```bash
+sudo dpkg -i dist/preyvpn_1.0.0_amd64.deb
+```
+
+Si aparecen errores de dependencias:
+```bash
+sudo apt-get install -f
+```
+
+**Ventajas:**
+- ✅ Instala todas las dependencias automáticamente
+- ✅ Configura permisos sudo automáticamente (no necesitarás usar sudo para ejecutar la app)
+- ✅ Crea entrada en el menú de aplicaciones
+- ✅ Instala icono del sistema
+- ✅ Desinstalación limpia con `sudo apt remove preyvpn`
+
+Después de instalar, busca "PreyVPN" en tu menú de aplicaciones.
+
+### Opción 2: Compilar con Docker (Para desarrolladores - NO requiere Go instalado)
 
 **Ventaja:** No necesitas instalar Go ni dependencias de desarrollo en tu PC.
 
@@ -72,7 +85,7 @@ task build-docker
 
 Ver [BUILD.md](BUILD.md) para documentación completa de compilación.
 
-### Opción 2: Compilar desde el código fuente (requiere Go)
+### Opción 3: Compilar desde el código fuente (requiere Go)
 
 1. **Clonar el repositorio**
    ```bash
@@ -99,83 +112,77 @@ Ver [BUILD.md](BUILD.md) para documentación completa de compilación.
 
    Esto copiará el binario a `/usr/local/bin/preyvpn`
 
-### Opción 2: Usar binario pre-compilado
+## Primer Uso
 
-Si recibes un binario ya compilado:
+### Configuración Inicial (muy simple)
 
-1. **Darle permisos de ejecución**
-   ```bash
-   chmod +x preyvpn
-   ```
+1. **Lanzar la aplicación**
+   - Si instalaste con .deb: busca "PreyVPN" en el menú de aplicaciones
+   - Si compilaste: ejecuta `./dist/preyvpn` o `preyvpn` si está en PATH
 
-2. **Moverlo a un directorio en PATH** (opcional)
-   ```bash
-   sudo mv preyvpn /usr/local/bin/
-   ```
+2. **Seleccionar archivo .ovpn**
+   - En el primer inicio, aparecerá un diálogo de bienvenida
+   - Haz clic en "Seleccionar Archivo VPN"
+   - Navega hasta tu archivo `.ovpn` y selecciónalo
+   - La aplicación guardará esta configuración automáticamente en `~/.config/PreyVPN/config.json`
 
-## Configuración
+3. **Cambiar archivo VPN** (opcional)
+   - Si necesitas cambiar el archivo .ovpn más tarde, usa el botón "Cambiar archivo VPN" en la ventana principal
 
-1. **Crear el directorio de configuración**
-   ```bash
-   mkdir -p ~/PreyVPN
-   ```
+**Nota:** Ya no necesitas crear directorios manualmente ni renombrar archivos. La aplicación lo maneja todo.
 
-   O usar el comando make:
-   ```bash
-   make setup-config
-   ```
+## Uso Diario
 
-2. **Colocar el archivo de configuración VPN**
+### Conectar a la VPN
 
-   Copia el archivo `.ovpn` que te proporciona tu organización:
-   ```bash
-   cp /ruta/a/tu/archivo.ovpn ~/PreyVPN/prey-prod.ovpn
-   ```
+1. **Ejecutar PreyVPN**
+   - Desde el menú de aplicaciones (si usaste .deb)
+   - O ejecuta `preyvpn` desde terminal
 
-   **Importante**: El archivo DEBE llamarse exactamente `prey-prod.ovpn`
-
-## Uso
-
-### Ejecutar la aplicación
-
-Si instalaste con `make install`:
-```bash
-preyvpn
-```
-
-Si no instalaste, desde el directorio del proyecto:
-```bash
-./bin/preyvpn
-```
-
-### Flujo de conexión
-
-1. **Abrir la aplicación**
-   - La aplicación verificará si existe el archivo de configuración
-   - Si no existe, mostrará instrucciones
-
-2. **Conectar**
-   - Presiona el botón "Conectar"
-   - Se te pedirá tu contraseña de administrador (para `pkexec`)
+2. **Presionar Conectar**
+   - La aplicación se minimizará al system tray (icono en la barra del sistema)
+   - **No necesitas usar sudo** - los permisos se configuraron automáticamente con el .deb
 
 3. **Autenticación**
    - **Paso 1**: Ingresa tu usuario corporativo
    - **Paso 2**: Ingresa tu contraseña
    - **Paso 3**: Ingresa tu código OTP de 6 dígitos
 
-4. **Conectado**
-   - Verás el mensaje "Conexión establecida ✅"
-   - Los logs mostrarán los eventos de conexión
+4. **Conexión establecida**
+   - El icono del system tray cambiará a verde ✅
+   - Verás "Conexión establecida" en los logs
+   - La ventana se puede minimizar (va al tray)
 
-5. **Desconectar**
-   - Presiona el botón "Desconectar"
-   - La conexión se cerrará limpiamente
+### System Tray
+
+**Iconos de estado:**
+- 🔘 **Gris**: Desconectado
+- 🟠 **Naranja**: Conectando/Autenticando
+- 🟢 **Verde**: Conectado exitosamente
+- 🔴 **Rojo**: Error de conexión
+
+**Menú del tray** (clic derecho en el icono):
+- **Estado**: Muestra el estado actual
+- **Conectar**: Inicia la conexión
+- **Desconectar**: Cierra la conexión
+- **Mostrar ventana**: Abre la ventana principal
+- **Salir**: Cierra completamente la aplicación
+
+**Minimizar a tray:**
+- Al cerrar la ventana (X), la app **NO se cierra**
+- Se minimiza al system tray y sigue funcionando
+- Para cerrar completamente: usa "Salir" del menú del tray
+
+### Desconectar
+
+- **Opción 1**: Presiona "Desconectar" en la ventana principal
+- **Opción 2**: Usa "Desconectar" en el menú del system tray
 
 ### Manejo de errores
 
 - **Contraseña incorrecta**: Se te pedirá ingresar solo la contraseña nuevamente
 - **OTP inválido/expirado**: Se te pedirá ingresar solo el OTP nuevamente
-- **Archivo de configuración no encontrado**: Verifica que `~/PreyVPN/prey-prod.ovpn` existe
+- **Archivo .ovpn no válido**: Usa el botón "Cambiar archivo VPN" para seleccionar otro
 
 ## Estructura del Proyecto
 
@@ -194,13 +201,32 @@ Si no instalaste, desde el directorio del proyecto:
 │   │   ├── linux/linux.go            # Implementación Linux (completa)
 │   │   ├── windows/windows.go        # Implementación Windows (stub)
 │   │   └── darwin/darwin.go          # Implementación macOS (stub)
+│   ├── tray/                          # ⭐ System tray abstraction
+│   │   ├── tray.go                   # Interface común (permite migrar a AppIndicator3)
+│   │   ├── systray.go                # Implementación con getlantern/systray
+│   │   └── icons/                    # Iconos de estado (PNG)
+│   ├── config/                        # ⭐ Configuración persistente
+│   │   └── config.go                 # Gestión de configuración JSON
 │   ├── ui/
 │   │   ├── app.go                    # Ventana principal (Fyne - cross-platform)
 │   │   └── prompts.go                # Modales de entrada
 │   └── logs/
 │       └── buffer.go                 # Buffer circular de logs
+├── packaging/                         # ⭐ Packaging para distribución
+│   ├── build-deb.sh                  # Script de construcción .deb
+│   ├── create-icon.py                # Generador de icono
+│   └── debian/                       # Estructura del paquete .deb
+│       ├── DEBIAN/
+│       │   ├── control               # Metadata y dependencias
+│       │   ├── postinst              # Configura sudo automáticamente
+│       │   └── prerm                 # Limpieza en desinstalación
+│       └── usr/
+│           ├── bin/                  # Binario instalado
+│           └── share/
+│               ├── applications/     # Desktop entry
+│               └── icons/            # Iconos del sistema
 ├── build/                             # Scripts de build por plataforma
-├── dist/                              # Binarios compilados multi-plataforma
+├── dist/                              # Binarios compilados y paquetes .deb
 ├── configs/                           # Configuraciones específicas por OS
 ├── go.mod                             # Dependencias
 ├── Makefile                           # Build system multi-plataforma
@@ -319,38 +345,112 @@ sudo apt install policykit-1
 sudo apt install libgl1-mesa-dev xorg-dev
 ```
 
+## Creación del Paquete .deb
+
+Si eres desarrollador y quieres reconstruir el paquete .deb:
+
+```bash
+# 1. Compilar el binario primero
+./dev.sh build-binary
+# O
+task build-docker
+
+# 2. Crear el icono (requiere Python + PIL)
+cd packaging
+python3 create-icon.py
+cd ..
+
+# 3. Construir el paquete .deb
+cd packaging
+./build-deb.sh
+
+# El paquete estará en dist/preyvpn_1.0.0_amd64.deb
+```
+
+Ver [packaging/debian/DEBIAN/control](packaging/debian/DEBIAN/control) para la lista completa de dependencias.
+
 ## Limitaciones y Roadmap
 
-### MVP Actual (Linux)
+### ✅ v1.0 Actual (Linux - Completo)
 
-Este es un MVP (Minimum Viable Product) enfocado en Linux con las siguientes limitaciones:
+Características implementadas:
 
-- ✅ Soporta Linux/Ubuntu completo
-- 🚧 Windows y macOS en desarrollo (estructura lista, implementación pendiente)
-- Solo un perfil VPN (prey-prod.ovpn)
-- No recuerda el usuario entre sesiones
+- ✅ Soporta Linux/Ubuntu completo con GUI
+- ✅ System tray con iconos de estado
+- ✅ File picker visual (selección gráfica de .ovpn)
+- ✅ Configuración persistente (~/.config/PreyVPN/)
+- ✅ Packaging .deb con configuración automática de permisos
+- ✅ Instalación desde menú de aplicaciones
+- ✅ Minimizar a tray en lugar de cerrar
+- ✅ Multi-factor authentication (usuario + password + OTP)
+
+Limitaciones actuales:
+
+- Solo soporta Linux (Windows y macOS en stubs)
+- No recuerda credenciales entre sesiones (por seguridad)
 - No tiene auto-reconexión
-- Packaging básico pendiente (.deb, .rpm, etc.)
+- System tray usa getlantern/systray (ver próximos pasos para AppIndicator3)
 
-### Próximas Versiones
+### 🔄 Próximos Pasos
 
-**v0.2 - Windows Support**
-- Implementación completa para Windows
-- Elevación con UAC
-- Instalador .msi
+#### Mejoras de System Tray (Corto Plazo)
 
-**v0.3 - macOS Support**
-- Implementación completa para macOS
-- Soporte para Apple Silicon
-- Bundle .app y .dmg
+**Migración a AppIndicator3** para mejor integración con GNOME:
 
-**v1.0 - Feature Complete**
-- Soporte de múltiples perfiles
-- Recordar usuario (keyring)
-- Auto-reconexión
-- Packaging nativo para todas las plataformas
+La arquitectura actual en `internal/tray/` está preparada para esto:
 
-Para más detalles, consulta [ARCHITECTURE.md](ARCHITECTURE.md)
+```go
+// internal/tray/tray.go - Interface común
+type TrayIcon interface {
+    SetTitle(title string)
+    SetIcon(iconType IconType)
+    SetTooltip(text string)
+    Run(onReady func(), onExit func())
+    Quit()
+}
+
+// Cambiar implementación sin tocar el resto del código:
+// internal/tray/tray.go
+func New(callbacks MenuCallbacks) TrayIcon {
+    return NewAppIndicator(callbacks)  // En lugar de NewSystray()
+}
+```
+
+**Pasos para implementar AppIndicator3:**
+
+1. Crear `internal/tray/appindicator.go` con implementación nativa
+2. Usar CGo con `libayatana-appindicator3` directamente
+3. Mejor integración con GNOME Shell y Unity
+4. Soporte para menús más complejos y notificaciones nativas
+
+#### Windows Support (v1.1)
+
+- [ ] Implementar `internal/platform/windows/` completo
+- [ ] System tray nativo de Windows
+- [ ] Elevación con UAC
+- [ ] Instalador .msi con WiX
+- [ ] Firmar código para Windows Defender
+
+#### macOS Support (v1.2)
+
+- [ ] Implementar `internal/platform/darwin/` completo
+- [ ] System tray para macOS (NSStatusBar)
+- [ ] Elevación con osascript/SMJobBless
+- [ ] Bundle .app y .dmg
+- [ ] Soporte completo para Apple Silicon (arm64)
+- [ ] Firmar y notarizar para Gatekeeper
+
+#### Features Adicionales (v1.3+)
+
+- [ ] Soporte de múltiples perfiles VPN
+- [ ] Recordar usuario (con keyring/Credential Manager/Keychain)
+- [ ] Auto-reconexión con backoff exponencial
+- [ ] Reglas polkit por grupo (sin prompt de contraseña)
+- [ ] Auto-update system
+- [ ] Logging configurable con niveles
+- [ ] Estadísticas de uso (tiempo conectado, datos transferidos)
+
+Para más detalles sobre la arquitectura y cómo implementar estas características, consulta [ARCHITECTURE.md](ARCHITECTURE.md)
 
 ## Soporte
 

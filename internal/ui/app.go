@@ -3,14 +3,20 @@ package ui
 import (
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sync"
 
+	"github.com/prey/preyvpn/internal/config"
 	"github.com/prey/preyvpn/internal/core"
 	"github.com/prey/preyvpn/internal/logs"
+	"github.com/prey/preyvpn/internal/tray"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
 	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/dialog"
+	"fyne.io/fyne/v2/storage"
 	"fyne.io/fyne/v2/widget"
 )
 
@@ -31,6 +37,8 @@ type App struct {
 	window    fyne.Window
 	state     AppState
 	logBuffer *logs.Buffer
+	trayIcon  *tray.Systray
+	config    *config.Config
 
 	// Thread-safety for state
 	stateMutex sync.RWMutex
@@ -40,6 +48,7 @@ type App struct {
 	connectBtn    *widget.Button
 	disconnectBtn *widget.Button
 	retryBtn      *widget.Button
+	changeFileBtn *widget.Button
 	logView       *widget.Entry
 	configStatus  *widget.Label
 
@@ -62,12 +71,64 @@ func NewApp() *App {
 		state:     StateDisconnected,
 	}
 
+	// Cargar o crear configuración
+	cfg, err := config.Load()
+	if err != nil {
+		if errors.Is(err, config.ErrConfigNotFound) {
+			// Primera ejecución - crear configuración por defecto
+			cfg = config.Default()
+		} else {
+			// Error cargando configuración
+			cfg = config.Default()
+		}
+	}
+	a.config = cfg
+
 	a.window = a.fyneApp.NewWindow("PreyVPN")
 	a.window.Resize(fyne.NewSize(700, 500))
+
+	// Configurar comportamiento al cerrar: minimizar a tray en vez de salir
+	a.window.SetCloseIntercept(func() {
+		a.window.Hide()
+	})
+
 	a.buildUI()
 	a.initializeStoredCredentials()
+	a.setupTrayIcon()
+
+	// Si no hay archivo .ovpn configurado, mostrar file picker
+	if !a.config.HasVPNConfig() || !a.config.IsVPNConfigValid() {
+		a.showWelcomeDialog()
+	}
 
 	return a
+}
+
+// setupTrayIcon configura el icono de system tray
+func (a *App) setupTrayIcon() {
+	callbacks := tray.MenuCallbacks{
+		OnConnect: func() {
+			a.window.Show() // Mostrar ventana primero
+			a.onConnect()
+		},
+		OnDisconnect: func() {
+			a.onDisconnect()
+		},
+		OnShowWindow: func() {
+			a.window.Show()
+			a.window.RequestFocus()
+		},
+		OnQuit: func() {
+			// Desconectar si está conectado
+			if a.manager != nil {
+				a.manager.Stop()
+			}
+			a.fyneApp.Quit()
+		},
+	}
+
+	a.trayIcon = tray.NewSystray(callbacks)
+	// NO llamar updateTrayIcon() aquí - el tray aún no está inicializado
 }
 
 // buildUI construye la interfaz de usuario
@@ -86,12 +147,16 @@ func (a *App) buildUI() {
 
 	a.retryBtn = widget.NewButton("Reintentar", func() {
 		a.updateConfigStatus()
-		if core.CheckConfigExists() {
+		if a.config.IsVPNConfigValid() {
 			a.connectBtn.Enable()
 			a.retryBtn.Hide()
 		}
 	})
 	a.retryBtn.Hide()
+
+	a.changeFileBtn = widget.NewButton("Cambiar archivo VPN", func() {
+		a.showFilePicker()
+	})
 
 	// Actualizar estado del config después de crear todos los widgets
 	a.updateConfigStatus()
@@ -106,6 +171,7 @@ func (a *App) buildUI() {
 		a.connectBtn,
 		a.disconnectBtn,
 		a.retryBtn,
+		a.changeFileBtn,
 	)
 
 	content := container.NewBorder(
@@ -155,29 +221,41 @@ func (a *App) initializeStoredCredentials() {
 
 // updateConfigStatus actualiza el estado del archivo de configuración
 func (a *App) updateConfigStatus() {
-	if core.CheckConfigExists() {
-		a.configStatus.SetText("✅ Perfil detectado: ~/PreyVPN/prey-prod.ovpn")
+	if a.config.IsVPNConfigValid() {
+		fileName := filepath.Base(a.config.VPNConfigPath)
+		a.configStatus.SetText(fmt.Sprintf("✅ Archivo VPN: %s", fileName))
 		a.connectBtn.Enable()
 		a.retryBtn.Hide()
-	} else {
-		a.configStatus.SetText("❌ Perfil no encontrado\n\nPor favor coloca tu archivo prey-prod.ovpn en ~/PreyVPN/")
+		a.changeFileBtn.Show()
+	} else if a.config.HasVPNConfig() {
+		// Tiene configurado pero el archivo no existe
+		fileName := filepath.Base(a.config.VPNConfigPath)
+		a.configStatus.SetText(fmt.Sprintf("❌ Archivo no encontrado: %s", fileName))
 		a.connectBtn.Disable()
-		a.retryBtn.Show()
+		a.retryBtn.Hide()
+		a.changeFileBtn.Show()
+	} else {
+		// No hay archivo configurado
+		a.configStatus.SetText("⚠️  No hay archivo VPN configurado")
+		a.connectBtn.Disable()
+		a.retryBtn.Hide()
+		a.changeFileBtn.Show()
 	}
 }
 
 // onConnect maneja el evento de conectar
 func (a *App) onConnect() {
 	// Verificar que exista el config
-	if !core.CheckConfigExists() {
-		ShowError(a.window, "Error", "No se encontró el archivo de configuración en ~/PreyVPN/prey-prod.ovpn")
+	if !a.config.IsVPNConfigValid() {
+		ShowError(a.window, "Error", "No se encontró el archivo de configuración VPN. Por favor selecciona un archivo.")
+		a.showFilePicker()
 		return
 	}
 
 	a.addLog("Iniciando conexión VPN...")
 
 	// Obtener la ruta del config
-	configPath := core.GetConfigPath()
+	configPath := a.config.VPNConfigPath
 
 	// Buscar el binario de OpenVPN
 	openvpnPath, err := core.FindOpenVPN()
@@ -371,6 +449,39 @@ func (a *App) setState(state AppState) {
 		a.statusLabel.SetText("Estado: Error ❌")
 	}
 	a.statusLabel.Refresh()
+
+	// Actualizar tray icon también
+	a.updateTrayIcon()
+}
+
+// updateTrayIcon actualiza el icono y estado del system tray
+func (a *App) updateTrayIcon() {
+	if a.trayIcon == nil {
+		return
+	}
+
+	state := a.getState()
+	switch state {
+	case StateDisconnected:
+		a.trayIcon.SetIcon(tray.IconDisconnected)
+		a.trayIcon.UpdateState("Desconectado", false)
+
+	case StateConnecting:
+		a.trayIcon.SetIcon(tray.IconConnecting)
+		a.trayIcon.UpdateState("Conectando...", false)
+
+	case StateAuthenticating:
+		a.trayIcon.SetIcon(tray.IconConnecting)
+		a.trayIcon.UpdateState("Autenticando...", false)
+
+	case StateConnected:
+		a.trayIcon.SetIcon(tray.IconConnected)
+		a.trayIcon.UpdateState("Conectado", true)
+
+	case StateError:
+		a.trayIcon.SetIcon(tray.IconError)
+		a.trayIcon.UpdateState("Error", false)
+	}
 }
 
 // addLog agrega una línea al buffer de logs y actualiza la UI
@@ -410,7 +521,106 @@ func fallbackCredentialsPathLabel() string {
 	return "~/.config/PreyVPN/credentials.json"
 }
 
-// Run inicia la aplicación
+// showWelcomeDialog muestra el diálogo de bienvenida para primera ejecución
+func (a *App) showWelcomeDialog() {
+	dialog.ShowCustom(
+		"👋 Bienvenido a PreyVPN",
+		"Continuar",
+		widget.NewLabel("Para comenzar, necesitas seleccionar tu archivo de configuración VPN (.ovpn)"),
+		a.window,
+	)
+
+	// Dar tiempo para que el usuario lea el mensaje
+	go func() {
+		// Esperar un poco y luego mostrar el file picker
+		a.showFilePicker()
+	}()
+}
+
+// showFilePicker muestra el selector de archivos para elegir un .ovpn
+func (a *App) showFilePicker() {
+	// Crear file dialog
+	fileDialog := dialog.NewFileOpen(func(reader fyne.URIReadCloser, err error) {
+		if err != nil {
+			a.addLog("Error al seleccionar archivo: " + err.Error())
+			return
+		}
+		if reader == nil {
+			// Usuario canceló
+			a.addLog("Selección de archivo cancelada")
+			return
+		}
+
+		// Obtener la ruta del archivo
+		filePath := reader.URI().Path()
+		reader.Close()
+
+		// Verificar que sea un archivo .ovpn
+		if filepath.Ext(filePath) != ".ovpn" {
+			ShowError(a.window, "Error", "Por favor selecciona un archivo .ovpn válido")
+			return
+		}
+
+		// Guardar en configuración
+		a.config.VPNConfigPath = filePath
+		if err := a.config.Save(); err != nil {
+			a.addLog("Error al guardar configuración: " + err.Error())
+			ShowError(a.window, "Error", "No se pudo guardar la configuración")
+			return
+		}
+
+		// Actualizar UI
+		a.updateConfigStatus()
+		fileName := filepath.Base(filePath)
+		a.addLog(fmt.Sprintf("✓ Archivo VPN seleccionado: %s", fileName))
+		ShowInfo(a.window, "Archivo configurado", fmt.Sprintf("Se ha configurado el archivo:\n%s\n\nYa puedes conectarte.", fileName))
+	}, a.window)
+
+	// Configurar filtro para solo mostrar archivos .ovpn
+	fileDialog.SetFilter(storage.NewExtensionFileFilter([]string{".ovpn"}))
+
+	// Intentar abrir en el directorio home del usuario
+	homeDir, err := storage.ListerForURI(storage.NewFileURI(getUserHomeDir()))
+	if err == nil {
+		fileDialog.SetLocation(homeDir)
+	}
+
+	fileDialog.Show()
+}
+
+// getUserHomeDir retorna el directorio home del usuario
+func getUserHomeDir() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "/"
+	}
+	return home
+}
+
+// Run inicia la aplicación con soporte de system tray
 func (a *App) Run() {
+	// Iniciar systray en un goroutine
+	// Systray.Run es bloqueante, por lo que lo ejecutamos en paralelo
+	go func() {
+		a.trayIcon.Run(
+			func() {
+				// onReady - tray está listo e inicializado
+				a.addLog("System tray inicializado")
+				// Ahora sí actualizar el icono del tray
+				a.updateTrayIcon()
+			},
+			func() {
+				// onExit - tray cerrado
+				a.fyneApp.Quit()
+			},
+		)
+	}()
+
+	// Iniciar la ventana de Fyne (bloqueante)
 	a.window.ShowAndRun()
+
+	// Cuando la ventana de Fyne se cierra, cerrar también el tray
+	if a.trayIcon != nil {
+		a.trayIcon.Quit()
+	}
 }

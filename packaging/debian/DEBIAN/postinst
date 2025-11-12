@@ -1,0 +1,62 @@
+#!/bin/bash
+# postinst script para preyvpn
+# Configura sudo para que no pida contraseña al ejecutar OpenVPN
+
+set -e
+
+case "$1" in
+    configure)
+        # Buscar el binario de OpenVPN
+        OPENVPN_PATH=""
+        for path in /usr/sbin/openvpn /usr/bin/openvpn /usr/local/sbin/openvpn; do
+            if [ -f "$path" ]; then
+                OPENVPN_PATH="$path"
+                break
+            fi
+        done
+
+        if [ -z "$OPENVPN_PATH" ]; then
+            echo "⚠️  ADVERTENCIA: OpenVPN no encontrado. PreyVPN necesita OpenVPN instalado."
+            echo "   Instálalo con: sudo apt install openvpn"
+        else
+            # Crear archivo sudoers para PreyVPN
+            SUDOERS_FILE="/etc/sudoers.d/preyvpn"
+
+            # Crear configuración que permite a TODOS los usuarios ejecutar openvpn sin contraseña
+            echo "# PreyVPN - Permitir ejecutar OpenVPN sin contraseña" > "$SUDOERS_FILE"
+            echo "ALL ALL=(ALL) NOPASSWD: $OPENVPN_PATH" >> "$SUDOERS_FILE"
+
+            # Configurar permisos correctos (CRÍTICO para sudoers)
+            chmod 0440 "$SUDOERS_FILE"
+
+            # Validar sintaxis
+            if visudo -c -f "$SUDOERS_FILE" >/dev/null 2>&1; then
+                echo "✅ PreyVPN configurado correctamente"
+                echo "   Los usuarios pueden ejecutar OpenVPN sin contraseña"
+            else
+                echo "❌ Error en configuración de sudo, eliminando..."
+                rm -f "$SUDOERS_FILE"
+            fi
+        fi
+
+        # Actualizar cache de desktop entries
+        if [ -x /usr/bin/update-desktop-database ]; then
+            update-desktop-database -q /usr/share/applications || true
+        fi
+
+        # Actualizar cache de iconos
+        if [ -x /usr/bin/gtk-update-icon-cache ]; then
+            gtk-update-icon-cache -q -t -f /usr/share/icons/hicolor || true
+        fi
+        ;;
+
+    abort-upgrade|abort-remove|abort-deconfigure)
+        ;;
+
+    *)
+        echo "postinst called with unknown argument \`$1'" >&2
+        exit 1
+        ;;
+esac
+
+exit 0

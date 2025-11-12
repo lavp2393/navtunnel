@@ -29,7 +29,7 @@
 ```
 Cliente OpenVPN
     ↓
-Servidor OpenVPN (cosmotron.prey.io:1195)
+Servidor OpenVPN (vpn.example.com:1194)
     ↓
 PAM (Pluggable Authentication Modules)
     ├─→ pam_sss (System Security Services - LDAP)
@@ -37,20 +37,20 @@ PAM (Pluggable Authentication Modules)
     │
     └─→ pam_linotp (LinOTP plugin)
         └─→ Valida: username + OTP
-            └─→ LinOTP Server (https://linotp.preyhq.com/validate/simplecheck)
-                └─→ Recibe: realm=vpn-srv&user=luisvazquez@preyhq.com&pass=<OTP>
+            └─→ LinOTP Server (https://otp.example.com/validate/simplecheck)
+                └─→ Recibe: realm=vpn&user=user@example.com&pass=<OTP>
 ```
 
 ### Log de Autenticación Exitosa (desde /var/log/auth.log)
 
 ```
-pam_linotp[372481]: connecting to url:https://linotp.preyhq.com/validate/simplecheck
-                     with parameters realm=vpn-srv&user=luisvazquez%40preyhq.com&pass=008335
-pam_linotp[372481]: result :-) User 'luisvazquez@preyhq.com' authenticated successfully
-pam_sss(openvpn:auth): authentication success; user=luisvazquez@preyhq.com
+pam_linotp[372481]: connecting to url:https://otp.example.com/validate/simplecheck
+                     with parameters realm=vpn&user=user%40example.com&pass=123456
+pam_linotp[372481]: result :-) User 'user@example.com' authenticated successfully
+pam_sss(openvpn:auth): authentication success; user=user@example.com
 ```
 
-**Clave:** LinOTP recibe `pass=008335` (solo el OTP de 6 dígitos, NO el password real).
+**Clave:** LinOTP recibe `pass=123456` (solo el OTP de 6 dígitos, NO el password real).
 
 ---
 
@@ -62,7 +62,7 @@ pam_sss(openvpn:auth): authentication success; user=luisvazquez@preyhq.com
 client
 dev tun
 proto udp
-remote cosmotron.prey.io 1195
+remote vpn.example.com 1194
 auth-user-pass
 static-challenge "Your OTP" 1    ← Indica que hay un challenge estático (OTP)
 auth-retry interact
@@ -98,13 +98,13 @@ pkexec openvpn \
 
 ```
 1. OpenVPN → Cliente: >PASSWORD:Need 'Auth' username/password SC:1,Your OTP
-2. Cliente → OpenVPN: username "Auth" "luisvazquez@preyhq.com"
+2. Cliente → OpenVPN: username "Auth" "user@example.com"
 3. OpenVPN → Cliente: SUCCESS: 'Auth' username entered, but not yet verified
 4. OpenVPN → Cliente: >PASSWORD:Need 'Auth' password
 5. Cliente → OpenVPN: password "Auth" "<password_real>"
 6. OpenVPN → Cliente: SUCCESS: 'Auth' password entered, but not yet verified
 7. OpenVPN → Cliente: >PASSWORD:Need 'Auth' password (SC response)
-8. Cliente → OpenVPN: password "Auth" "123456"
+8. Cliente → OpenVPN: password "Auth" "654321"
 9. OpenVPN valida con PAM/LinOTP
 10. OpenVPN → Cliente: >STATE:*,CONNECTED,SUCCESS,*
 ```
@@ -113,9 +113,9 @@ pkexec openvpn \
 
 ```
 1. OpenVPN → Cliente: >PASSWORD:Need 'Auth' username/password SC:1,Your OTP
-2. Cliente → OpenVPN: username "Auth" "luisvazquez@preyhq.com"
+2. Cliente → OpenVPN: username "Auth" "user@example.com"
 3. OpenVPN → Cliente: SUCCESS: 'Auth' username entered, but not yet verified
-4. ⚠️ OpenVPN envía: SENT CONTROL [PreyINC]: 'PUSH_REQUEST' (status=1)
+4. ⚠️ OpenVPN envía: SENT CONTROL [ServerName]: 'PUSH_REQUEST' (status=1)
    └─→ Esto indica que OpenVPN piensa que la auth está completa
 5. OpenVPN → Cliente: AUTH: Received control message: AUTH_FAILED
 6. OpenVPN → Cliente: >PASSWORD:Verification Failed: 'Auth'
@@ -171,14 +171,14 @@ if m.passwordSent && strings.HasPrefix(line, ">PASSWORD:") {
 
 ```go
 // Username
-username "Auth" "luisvazquez@preyhq.com"
+username "Auth" "user@example.com"
 
 // Password (con escape de caracteres especiales)
 password "Auth" "MyP@ssw0rd!123"
                  └─ Entrecomillado para manejar: espacios, @, !, #, $, etc.
 
 // OTP
-password "Auth" "123456"
+password "Auth" "789012"
 ```
 
 ---
@@ -232,7 +232,7 @@ AUTH_FAILED
 
 ### Ver logs del servidor OpenVPN
 ```bash
-ssh user@cosmotron.prey.io
+ssh user@vpn.example.com
 sudo tail -f /var/log/auth.log
 ```
 
@@ -243,10 +243,10 @@ sudo openvpn --config ~/PreyVPN/prey-prod.ovpn --verb 4
 
 **Flujo esperado:**
 ```
-Enter Auth Username: luisvazquez@preyhq.com
+Enter Auth Username: user@example.com
 Enter Auth Password: <password_real>
-CHALLENGE: Your OTP 883697
-Response: 883697
+CHALLENGE: Your OTP 345678
+Response: 345678
 ```
 
 ### Probar con Management Interface manual
@@ -263,11 +263,11 @@ telnet 127.0.0.1 7505
 # Enviar comandos:
 hold release
 # Esperar prompt >PASSWORD:...
-username "Auth" "luisvazquez@preyhq.com"
+username "Auth" "user@example.com"
 # Esperar SUCCESS y siguiente prompt
 password "Auth" "<password>"
 # Esperar siguiente prompt
-password "Auth" "123456"
+password "Auth" "901234"
 ```
 
 ---
@@ -300,7 +300,7 @@ Usar `expect` para automatizar la interacción con OpenVPN CLI:
 ```tcl
 spawn openvpn --config prey-prod.ovpn
 expect "Enter Auth Username:"
-send "luisvazquez@preyhq.com\r"
+send "user@example.com\r"
 expect "Enter Auth Password:"
 send "$password\r"
 expect "CHALLENGE: Your OTP"

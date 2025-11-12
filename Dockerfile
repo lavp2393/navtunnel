@@ -12,6 +12,9 @@ RUN apt-get update && apt-get install -y \
     libxinerama-dev \
     libxi-dev \
     libxxf86vm-dev \
+    # Dependencias de systray
+    pkg-config \
+    libayatana-appindicator3-dev \
     # OpenVPN para pruebas
     openvpn \
     # Herramientas útiles

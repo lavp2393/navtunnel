@@ -333,6 +333,19 @@ sudo apt install policykit-1
 - Verifica que el archivo existe: `ls -la ~/NavTunnel/tu-archivo.ovpn`
 - Verifica los permisos: `chmod 644 ~/NavTunnel/tu-archivo.ovpn`
 
+### Error: "--up script fails with '/etc/openvpn/update-systemd-resolved'"
+**Causa:** Tu archivo .ovpn requiere el script `update-systemd-resolved` que no está instalado.
+
+**Solución:**
+```bash
+sudo apt install openvpn-systemd-resolved
+```
+
+**Nota:** Si instalas NavTunnel v1.0.0 o superior con el .deb, esta dependencia se instala automáticamente. Si el error persiste después de reinstalar, verifica que el script existe:
+```bash
+ls -l /etc/openvpn/update-systemd-resolved
+```
+
 ### OTP siempre falla
 - Verifica que la hora de tu sistema esté sincronizada:
   ```bash

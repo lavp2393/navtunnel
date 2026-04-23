@@ -214,7 +214,15 @@
   });
 
   btnDisconnect.addEventListener("click", async () => {
-    await api("/api/disconnect", { method: "POST", body: "{}" });
+    // Feedback inmediato: el backend hace la limpieza async y confirma
+    // por SSE con un evento "disconnected".
+    btnDisconnect.disabled = true;
+    btnConnect.disabled = true;
+    statusText.textContent = "Desconectando...";
+    setDot("dot-wait");
+    try {
+      await api("/api/disconnect", { method: "POST", body: "{}" });
+    } catch {}
   });
 
   btnBrowse.addEventListener("click", async () => {

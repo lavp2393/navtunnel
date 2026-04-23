@@ -234,8 +234,13 @@ func (a *App) openPanel() {
 	if a.server == nil {
 		return
 	}
-	if err := openAppWindow(a.server.url()); err != nil {
-		a.addLog("No se pudo abrir la ventana del panel: " + err.Error())
+	url := a.server.url()
+	if err := spawnPanel(url); err != nil {
+		a.addLog("No se pudo abrir la ventana nativa: " + err.Error())
+		if fbErr := openBrowserFallback(url); fbErr != nil {
+			a.addLog("Tampoco se pudo abrir el navegador: " + fbErr.Error())
+			a.addLog("Abrí manualmente: " + url)
+		}
 	}
 }
 
@@ -293,11 +298,20 @@ func (a *App) routeEvent(ev core.Event) {
 
 	case core.EventAskUser:
 		a.credMu.Lock()
-		prefill := a.savedUsername
+		saved := a.savedUsername
 		a.credMu.Unlock()
-		a.hub.broadcast(hubEvent{Type: "ask-user", Message: ev.Message + prefillHint(prefill)})
+		if saved != "" && a.autoSendUsername(saved) {
+			return
+		}
+		a.hub.broadcast(hubEvent{Type: "ask-user", Message: ev.Message + prefillHint(saved)})
 
 	case core.EventAskPass:
+		a.credMu.Lock()
+		saved := a.savedPassword
+		a.credMu.Unlock()
+		if saved != "" && a.autoSendPassword(saved) {
+			return
+		}
 		a.hub.broadcast(hubEvent{Type: "ask-pass", Message: ev.Message})
 
 	case core.EventAskOTP:
@@ -308,10 +322,12 @@ func (a *App) routeEvent(ev core.Event) {
 		a.addLog(ev.Message)
 
 	case core.EventAuthFailed:
+		// Si el fallo vino con credenciales persistidas, invalidarlas para
+		// que el próximo ask-user/pass pregunte al usuario en vez de reenviar
+		// las mismas credenciales malas en loop.
+		a.invalidateSavedFor(ev.Stage)
 		a.hub.broadcast(hubEvent{Type: "auth-failed", Message: ev.Message, Stage: ev.Stage})
 		a.addLog("✗ " + ev.Message)
-		// Si el usuario habilitó "recordar" y las creds fallaron, no borramos nada
-		// todavía: el Manager pedirá de nuevo y el usuario podrá corregir.
 
 	case core.EventFatal:
 		a.hub.broadcast(hubEvent{Type: "fatal", Message: ev.Message})
@@ -332,6 +348,60 @@ func prefillHint(user string) string {
 		return ""
 	}
 	return " (último: " + user + ")"
+}
+
+// autoSendUsername envía directamente el username guardado sin mostrar el
+// modal al usuario. Devuelve true si el envío salió bien; false si hay que
+// caer al prompt manual (p.ej. Manager no listo, error de socket).
+func (a *App) autoSendUsername(v string) bool {
+	a.mu.Lock()
+	fn := a.sendFns.Username
+	a.mu.Unlock()
+	if fn == nil {
+		return false
+	}
+	if err := fn(v); err != nil {
+		a.addLog("No se pudo enviar usuario guardado: " + err.Error())
+		return false
+	}
+	a.addLog("✓ Usuario enviado (recordado)")
+	return true
+}
+
+// autoSendPassword envía directamente la contraseña guardada. Mismo
+// contrato que autoSendUsername.
+func (a *App) autoSendPassword(v string) bool {
+	a.mu.Lock()
+	fn := a.sendFns.Password
+	a.mu.Unlock()
+	if fn == nil {
+		return false
+	}
+	if err := fn(v); err != nil {
+		a.addLog("No se pudo enviar contraseña guardada: " + err.Error())
+		return false
+	}
+	a.addLog("✓ Contraseña enviada (recordada)")
+	return true
+}
+
+// invalidateSavedFor borra de memoria y del storage persistente las
+// credenciales que causaron un AUTH_FAILED. No toca la bandera "recordar":
+// si el usuario ingresa credenciales nuevas correctas, volverán a guardarse.
+func (a *App) invalidateSavedFor(stage string) {
+	a.credMu.Lock()
+	switch stage {
+	case "username":
+		a.savedUsername = ""
+		a.savedPassword = ""
+	case "password":
+		a.savedPassword = ""
+	default:
+		a.credMu.Unlock()
+		return
+	}
+	a.credMu.Unlock()
+	go func() { _ = core.DeleteCredentials() }()
 }
 
 // --- Credenciales ---------------------------------------------------------

@@ -7,17 +7,17 @@ FROM golang:1.22-bookworm AS builder
 
 # Instalar solo dependencias necesarias para compilar
 RUN apt-get update && apt-get install -y \
-    libgl1-mesa-dev \
-    xorg-dev \
-    libx11-dev \
-    libxrandr-dev \
-    libxcursor-dev \
-    libxinerama-dev \
-    libxi-dev \
-    libxxf86vm-dev \
     pkg-config \
     libayatana-appindicator3-dev \
+    libwebkit2gtk-4.1-dev \
     && rm -rf /var/lib/apt/lists/*
+
+# webview/webview_go pide pkg-config webkit2gtk-4.0, pero las distros modernas
+# (Ubuntu 24.04, Fedora 39+) solo proveen webkit2gtk-4.1. Las APIs usadas son
+# binario-compatibles; creamos un alias para que pkg-config resuelva 4.0 -> 4.1
+# y el binario quede linkeado contra libwebkit2gtk-4.1.so.0 en runtime.
+RUN cp /usr/lib/x86_64-linux-gnu/pkgconfig/webkit2gtk-4.1.pc \
+       /usr/lib/x86_64-linux-gnu/pkgconfig/webkit2gtk-4.0.pc
 
 WORKDIR /build
 
@@ -29,7 +29,7 @@ RUN go mod download
 COPY . .
 
 # Compilar el binario
-# -ldflags="-s -w" reduce el tamaño eliminando símbolos de debug
+# -ldflags="-s -w" reduce el tamaño eliminando símbolos de debug.
 RUN CGO_ENABLED=1 GOOS=linux GOARCH=amd64 \
     go build -ldflags="-s -w" -o navtunnel ./cmd/navtunnel
 

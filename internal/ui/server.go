@@ -185,8 +185,11 @@ func (s *server) handleConnect(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *server) handleDisconnect(w http.ResponseWriter, _ *http.Request) {
-	s.app.disconnect()
-	w.WriteHeader(http.StatusNoContent)
+	// Desconectar puede tardar segundos (SIGTERM al proceso openvpn + wait).
+	// Respondemos ya y corremos la limpieza en background: la UI mostrará el
+	// cambio a "Desconectado" cuando llegue el evento por SSE.
+	go s.app.disconnect()
+	w.WriteHeader(http.StatusAccepted)
 }
 
 func (s *server) handleCredential(w http.ResponseWriter, r *http.Request) {

@@ -18,6 +18,11 @@ import (
 	"github.com/lavp2393/navtunnel/internal/platform"
 )
 
+// authReadTimeout es el deadline por operación de lectura durante el
+// handshake inicial con el management. Se aplica a cada Read por separado,
+// no como deadline total, para no acumular tiempo entre líneas.
+const authReadTimeout = 10 * time.Second
+
 // EventType representa el tipo de evento emitido por el Manager.
 type EventType int
 
@@ -140,7 +145,21 @@ func Start(ovpnPath, openvpnBinary string) (*Manager, error) {
 	}
 
 	cmd := exec.Command(program, fullArgs...)
-	// Los logs vienen por el management socket (log on all); no necesitamos stdout/stderr.
+	// Capturamos stdout/stderr además del management socket: antes de que el
+	// management esté listo (arranque temprano, errores de config, mensajes
+	// del elevador pkexec/osascript), el socket aún no emite, pero stderr sí.
+	// Los volcamos a m.events como EventLogLine.
+	stdoutPipe, err := cmd.StdoutPipe()
+	if err != nil {
+		_ = os.Remove(pwFile)
+		return nil, fmt.Errorf("creando stdout pipe: %w", err)
+	}
+	stderrPipe, err := cmd.StderrPipe()
+	if err != nil {
+		_ = stdoutPipe.Close()
+		_ = os.Remove(pwFile)
+		return nil, fmt.Errorf("creando stderr pipe: %w", err)
+	}
 	if err := cmd.Start(); err != nil {
 		_ = os.Remove(pwFile)
 		return nil, fmt.Errorf("iniciando openvpn: %w", err)
@@ -164,6 +183,13 @@ func Start(ovpnPath, openvpnBinary string) (*Manager, error) {
 		metrics:    newMetricsStore(),
 	}
 
+	// Drenar stdout/stderr desde ya para que cualquier mensaje temprano del
+	// proceso (p.ej. "Options error: ..." antes de abrir el management)
+	// aparezca en la UI sin bloquear al proceso por pipes llenos.
+	m.wg.Add(2)
+	go m.drainPipe(stdoutPipe, "[openvpn] ")
+	go m.drainPipe(stderrPipe, "[openvpn] ")
+
 	if err := m.authenticateSocket(cookie); err != nil {
 		m.cleanupStart()
 		return nil, err
@@ -182,6 +208,18 @@ func Start(ovpnPath, openvpnBinary string) (*Manager, error) {
 	go m.waitProcess()
 
 	return m, nil
+}
+
+// drainPipe lee línea por línea del stdout/stderr del proceso openvpn y
+// reemite cada línea como EventLogLine con un prefijo discriminante.
+func (m *Manager) drainPipe(r io.ReadCloser, prefix string) {
+	defer m.wg.Done()
+	defer r.Close()
+	sc := bufio.NewScanner(r)
+	sc.Buffer(make([]byte, 0, 4096), 1024*1024)
+	for sc.Scan() {
+		m.emit(Event{Type: EventLogLine, Message: prefix + sc.Text()})
+	}
 }
 
 // Events expone el canal de eventos del manager.
@@ -213,10 +251,10 @@ func (m *Manager) Stop() {
 			_ = m.writeCommandIgnoreStop("signal SIGTERM")
 		}
 
-		// Esperar a que el proceso salga solo; si no lo hace en 3 s, forzar.
+		// Esperar a que el proceso salga solo; si no lo hace en 1.5 s, forzar.
 		select {
 		case <-m.procExited:
-		case <-time.After(3 * time.Second):
+		case <-time.After(1500 * time.Millisecond):
 			if m.cmd != nil && m.cmd.Process != nil {
 				_ = m.cmd.Process.Kill()
 			}
@@ -247,45 +285,61 @@ func (m *Manager) writeCommandIgnoreStop(cmd string) error {
 
 // --- Autenticación del socket management ------------------------------------
 
+// authenticateSocket completa el handshake con el management:
+//  1. Espera ver "ENTER PASSWORD:" — openvpn lo emite sin newline, así que
+//     leemos caracter a caracter y cortamos al detectarlo.
+//  2. Envía el cookie + "\n".
+//  3. Espera una línea que empiece con "SUCCESS:" (o "ERROR:" si el cookie
+//     no coincide, cosa que no debería pasar porque la generamos nosotros).
+//
+// El deadline se renueva antes de cada operación de lectura para no
+// acumular el tiempo entre pasos del handshake.
 func (m *Manager) authenticateSocket(cookie string) error {
-	_ = m.conn.SetReadDeadline(time.Now().Add(3 * time.Second))
 	defer func() { _ = m.conn.SetReadDeadline(time.Time{}) }()
 
-	var greeted bool
-	for i := 0; i < 20 && !greeted; i++ {
-		line, err := m.readLineRaw()
-		if err != nil {
-			return fmt.Errorf("management no envió prompt de auth: %w", err)
-		}
-		if strings.Contains(line, "ENTER PASSWORD:") {
-			greeted = true
-		}
-	}
-	if !greeted {
-		return fmt.Errorf("management no pidió password tras 20 líneas")
+	if err := m.readUntilPasswordPrompt(); err != nil {
+		return fmt.Errorf("management no envió prompt de auth: %w", err)
 	}
 	if _, err := m.conn.Write([]byte(cookie + "\n")); err != nil {
-		return err
+		return fmt.Errorf("escribiendo cookie de auth: %w", err)
 	}
-	line, err := m.readLineRaw()
-	if err != nil {
-		return err
+	_ = m.conn.SetReadDeadline(time.Now().Add(authReadTimeout))
+	line, err := m.reader.ReadString('\n')
+	if err != nil && line == "" {
+		return fmt.Errorf("leyendo respuesta de auth: %w", err)
 	}
-	if !strings.HasPrefix(strings.TrimSpace(line), "SUCCESS:") {
-		return fmt.Errorf("auth al management falló: %s", strings.TrimSpace(line))
+	resp := strings.TrimSpace(line)
+	if !strings.HasPrefix(resp, "SUCCESS:") {
+		return fmt.Errorf("auth al management falló: %s", resp)
 	}
 	return nil
 }
 
-// readLineRaw lee una línea del socket. El prompt "ENTER PASSWORD:" no viene
-// con \n, así que también corta cuando detectamos esa substring.
-func (m *Manager) readLineRaw() (string, error) {
-	// Intentamos ReadString primero (caso normal con \n).
-	line, err := m.reader.ReadString('\n')
-	if err != nil && !errors.Is(err, io.EOF) && line == "" {
-		return "", err
+// readUntilPasswordPrompt consume el socket byte a byte hasta que el buffer
+// acumulado contenga "ENTER PASSWORD:". openvpn emite ese prompt sin
+// newline, así que ReadString('\n') bloquearía. Deja en el buffer cualquier
+// dato posterior (el siguiente Read ya es bufio).
+func (m *Manager) readUntilPasswordPrompt() error {
+	const needle = "ENTER PASSWORD:"
+	var acc strings.Builder
+	for {
+		_ = m.conn.SetReadDeadline(time.Now().Add(authReadTimeout))
+		b, err := m.reader.ReadByte()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return fmt.Errorf("socket cerrado sin prompt (leído: %q)", acc.String())
+			}
+			return err
+		}
+		acc.WriteByte(b)
+		if strings.Contains(acc.String(), needle) {
+			return nil
+		}
+		// Evitar que acc crezca indefinidamente si algo raro ocurre.
+		if acc.Len() > 4096 {
+			return fmt.Errorf("no se encontró prompt tras 4KB: %q", acc.String())
+		}
 	}
-	return strings.TrimRight(line, "\r\n"), nil
 }
 
 // --- Loop principal ---------------------------------------------------------
@@ -550,6 +604,14 @@ func (m *Manager) cleanupStart() {
 	}
 	if m.cmd != nil && m.cmd.Process != nil {
 		_ = m.cmd.Process.Kill()
+	}
+	// Esperar que las goroutines de drain (stdout/stderr) salgan tras el Kill.
+	// Normalmente toma <100 ms (el kernel cierra los FDs y Scan() retorna).
+	done := make(chan struct{})
+	go func() { m.wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
 	}
 	_ = os.Remove(m.pwFilePath)
 }

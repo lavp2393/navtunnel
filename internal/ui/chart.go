@@ -39,13 +39,16 @@ func NewTrafficChart(minSize fyne.Size) *TrafficChart {
 }
 
 // Push agrega una muestra (bytes/s) al buffer circular y dispara un
-// redibujo del raster. Es seguro llamar desde cualquier goroutine.
+// redibujo del raster. Es seguro llamar desde cualquier goroutine: el
+// mutate del buffer ocurre con mu, y el Refresh se delega al thread
+// de Fyne con fyne.Do — v2.7+ exige que todo operación de canvas
+// ocurra ahí.
 func (c *TrafficChart) Push(rx, tx float64) {
 	c.mu.Lock()
 	c.rxBuf = append(c.rxBuf[1:], rx)
 	c.txBuf = append(c.txBuf[1:], tx)
 	c.mu.Unlock()
-	canvas.Refresh(c.raster)
+	fyne.Do(func() { canvas.Refresh(c.raster) })
 }
 
 // Reset vuelve el chart a ceros (al desconectar, por ejemplo).
@@ -56,7 +59,7 @@ func (c *TrafficChart) Reset() {
 		c.txBuf[i] = 0
 	}
 	c.mu.Unlock()
-	canvas.Refresh(c.raster)
+	fyne.Do(func() { canvas.Refresh(c.raster) })
 }
 
 // CreateRenderer devuelve el renderer que empaqueta el raster dentro del

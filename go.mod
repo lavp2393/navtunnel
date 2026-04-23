@@ -4,7 +4,6 @@ go 1.21
 
 require (
 	fyne.io/fyne/v2 v2.4.5
-	github.com/creack/pty v1.1.24
 	github.com/getlantern/systray v1.2.2
 	github.com/zalando/go-keyring v0.2.6
 )

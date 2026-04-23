@@ -1,0 +1,131 @@
+name: Release
+
+# Se dispara al empujar un tag semver (v1.2.3). Para generar una release:
+#   git tag -a v0.1.0 -m "First release"
+#   git push origin v0.1.0
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            goos: linux
+            goarch: amd64
+            archive: tar.gz
+            binext: ""
+          - os: macos-13 # runner Intel — GitHub deprecará en el futuro pero sirve.
+            goos: darwin
+            goarch: amd64
+            archive: tar.gz
+            binext: ""
+          - os: macos-latest # runner Apple Silicon.
+            goos: darwin
+            goarch: arm64
+            archive: tar.gz
+            binext: ""
+          - os: windows-latest
+            goos: windows
+            goarch: amd64
+            archive: zip
+            binext: ".exe"
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache: true
+
+      # Fyne necesita headers X11/OpenGL + AppIndicator para el tray en Linux.
+      - name: Install Linux build dependencies
+        if: matrix.goos == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config \
+            libgl1-mesa-dev xorg-dev \
+            libxrandr-dev libxcursor-dev libxinerama-dev libxi-dev libxxf86vm-dev \
+            libayatana-appindicator3-dev
+
+      - name: Build navtunnel
+        shell: bash
+        env:
+          CGO_ENABLED: "1"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          mkdir -p dist
+          tag="${GITHUB_REF_NAME}"
+          out="dist/navtunnel${{ matrix.binext }}"
+          go build -ldflags "-s -w -X main.version=${tag}" -o "${out}" ./cmd/navtunnel
+
+      - name: Package (tar.gz)
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          name="navtunnel_${tag}_${{ matrix.goos }}_${{ matrix.goarch }}"
+          cp README.md LICENSE dist/ 2>/dev/null || true
+          (cd dist && tar czf "${name}.tar.gz" navtunnel README.md LICENSE 2>/dev/null || tar czf "${name}.tar.gz" navtunnel)
+          ls -lh dist/
+
+      - name: Package (zip)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          $name = "navtunnel_${tag}_${{ matrix.goos }}_${{ matrix.goarch }}"
+          Copy-Item README.md, LICENSE dist/ -ErrorAction SilentlyContinue
+          Compress-Archive -Path dist/navtunnel.exe, dist/README.md, dist/LICENSE -DestinationPath "dist/$name.zip" -ErrorAction SilentlyContinue
+          Get-ChildItem dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: navtunnel-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/navtunnel_*
+          if-no-files-found: error
+          retention-days: 1
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -lhR dist
+
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum navtunnel_* > SHA256SUMS
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/navtunnel_*
+            dist/SHA256SUMS
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          fail_on_unmatched_files: true

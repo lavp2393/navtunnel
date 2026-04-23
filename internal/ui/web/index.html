@@ -7,72 +7,114 @@
   <link rel="stylesheet" href="./style.css">
 </head>
 <body>
-  <header>
-    <div class="brand">NavTunnel</div>
-    <div class="status">
+  <div class="bg-grid"></div>
+  <div class="bg-glow"></div>
+
+  <header class="topbar">
+    <div class="brand">
+      <div class="brand-mark">◈</div>
+      <div class="brand-text">
+        <div class="brand-title">NAV<span class="accent">TUNNEL</span></div>
+        <div class="brand-sub">SECURE CHANNEL v1.0</div>
+      </div>
+    </div>
+    <div class="status-pill" id="status-pill">
       <span id="status-dot" class="dot dot-off"></span>
-      <span id="status-text">Desconectado</span>
+      <span id="status-text">DESCONECTADO</span>
     </div>
   </header>
 
+  <nav class="tabs" role="tablist">
+    <button class="tab active" data-tab="dashboard" role="tab" aria-selected="true">DASHBOARD</button>
+    <button class="tab" data-tab="logs" role="tab" aria-selected="false">LOGS</button>
+  </nav>
+
   <main>
-    <section class="card">
-      <div class="row">
-        <button id="btn-connect" class="primary">Conectar</button>
-        <button id="btn-disconnect" class="secondary" disabled>Desconectar</button>
+    <section id="tab-dashboard" class="tab-panel active">
+      <div class="card chart-card">
+        <div class="card-header">
+          <h2>TRÁFICO EN VIVO</h2>
+          <div class="legend">
+            <span class="legend-item legend-rx"><span class="dot-rx"></span>RX</span>
+            <span class="legend-item legend-tx"><span class="dot-tx"></span>TX</span>
+          </div>
+        </div>
+        <div class="chart-wrap">
+          <canvas id="traffic-chart"></canvas>
+        </div>
+        <div class="chart-readout">
+          <div class="ro ro-rx">
+            <div class="ro-label">↓ RX RATE</div>
+            <div class="ro-value" id="ro-rx-rate">0 B/s</div>
+          </div>
+          <div class="ro ro-tx">
+            <div class="ro-label">↑ TX RATE</div>
+            <div class="ro-value" id="ro-tx-rate">0 B/s</div>
+          </div>
+        </div>
       </div>
-      <div class="row config-row">
-        <label for="ovpn-path">Archivo .ovpn</label>
-        <input id="ovpn-path" type="text" placeholder="Ruta al archivo .ovpn" spellcheck="false">
-        <button id="btn-browse" class="ghost">Examinar</button>
-        <button id="btn-save-config" class="ghost">Guardar</button>
-      </div>
-    </section>
 
-    <section class="card metrics-card">
-      <h2>Métricas</h2>
-      <div class="metrics-grid">
-        <div class="metric">
-          <div class="metric-label">↓ Recibido</div>
+      <div class="grid-4">
+        <div class="card metric-card">
+          <div class="metric-label">TOTAL RX</div>
           <div class="metric-value" id="m-rx">0 B</div>
-          <div class="metric-sub" id="m-rx-rate">0 B/s</div>
         </div>
-        <div class="metric">
-          <div class="metric-label">↑ Enviado</div>
+        <div class="card metric-card">
+          <div class="metric-label">TOTAL TX</div>
           <div class="metric-value" id="m-tx">0 B</div>
-          <div class="metric-sub" id="m-tx-rate">0 B/s</div>
         </div>
-        <div class="metric">
-          <div class="metric-label">TUN</div>
-          <div class="metric-value" id="m-tun">—</div>
-          <div class="metric-sub" id="m-since">—</div>
+        <div class="card metric-card">
+          <div class="metric-label">TUN IP</div>
+          <div class="metric-value mono" id="m-tun">—</div>
         </div>
-        <div class="metric">
-          <div class="metric-label">Servidor</div>
-          <div class="metric-value" id="m-server">—</div>
-          <div class="metric-sub" id="m-state">—</div>
+        <div class="card metric-card">
+          <div class="metric-label">SERVIDOR</div>
+          <div class="metric-value mono" id="m-server">—</div>
+        </div>
+      </div>
+
+      <div class="card controls-card">
+        <div class="controls-row">
+          <button id="btn-connect" class="btn-primary">◉ CONECTAR</button>
+          <button id="btn-disconnect" class="btn-secondary" disabled>⊗ DESCONECTAR</button>
+          <span class="controls-state" id="controls-state">—</span>
+        </div>
+        <div class="config-row">
+          <span class="config-label">OVPN</span>
+          <input id="ovpn-path" type="text" placeholder="/ruta/al/archivo.ovpn" spellcheck="false">
+          <button id="btn-browse" class="btn-ghost">EXAMINAR</button>
+          <button id="btn-save-config" class="btn-ghost">GUARDAR</button>
         </div>
       </div>
     </section>
 
-    <section class="card logs-card">
-      <h2>Logs</h2>
-      <pre id="logs" aria-live="polite"></pre>
+    <section id="tab-logs" class="tab-panel">
+      <div class="card logs-card">
+        <div class="card-header">
+          <h2>LOG STREAM</h2>
+          <button id="btn-clear-logs" class="btn-ghost small">LIMPIAR</button>
+        </div>
+        <pre id="logs" aria-live="polite"></pre>
+      </div>
     </section>
   </main>
 
   <div id="modal" class="modal-overlay hidden" role="dialog" aria-modal="true">
     <div class="modal">
-      <h3 id="modal-title">Autenticación</h3>
+      <div class="modal-corner tl"></div>
+      <div class="modal-corner tr"></div>
+      <div class="modal-corner bl"></div>
+      <div class="modal-corner br"></div>
+      <h3 id="modal-title">AUTENTICACIÓN</h3>
       <p id="modal-message"></p>
       <form id="modal-form">
-        <input id="modal-input" type="text" autocomplete="off">
+        <input id="modal-input" type="text" autocomplete="off" spellcheck="false">
         <label id="modal-remember-label" class="remember hidden">
           <input id="modal-remember" type="checkbox"> Recordar credenciales
         </label>
-        <div class="row right">
-          <button type="button" id="modal-cancel" class="ghost">Cancelar</button>
-          <button type="submit" class="primary">Enviar</button>
+        <div class="modal-actions">
+          <button type="button" id="modal-cancel" class="btn-ghost">CANCELAR</button>
+          <button type="submit" class="btn-primary">ENVIAR ▸</button>
         </div>
       </form>
     </div>

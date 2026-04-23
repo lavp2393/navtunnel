@@ -590,11 +590,22 @@ func (m *Manager) writeCommand(cmd string) error {
 	return err
 }
 
+// emit publica un evento sin bloquear.
+//
+// Importante: NO escucha stopCh. Si lo hiciera, el orden de cierre en Stop()
+// (cerrar stopCh → matar proceso → wg.Wait() → cerrar events) haría que
+// waitProcess emita EventDisconnected *después* de que stopCh esté cerrado,
+// y el select elegiría stopCh descartando el evento — la UI quedaría
+// pegada en "Desconectando...". Al confiar en el buffer (256) y en el
+// recover() para el caso raro de envío a canal cerrado, no perdemos el
+// evento final.
 func (m *Manager) emit(e Event) {
 	defer func() { _ = recover() }()
 	select {
 	case m.events <- e:
-	case <-m.stopCh:
+	default:
+		// Buffer lleno: descartar. El consumidor está vivo pero atrasado,
+		// no queremos que readLoop/waitProcess bloqueen por la UI.
 	}
 }
 

@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>NavTunnel</title>
+  <link rel="stylesheet" href="./style.css">
+</head>
+<body>
+  <header>
+    <div class="brand">NavTunnel</div>
+    <div class="status">
+      <span id="status-dot" class="dot dot-off"></span>
+      <span id="status-text">Desconectado</span>
+    </div>
+  </header>
+
+  <main>
+    <section class="card">
+      <div class="row">
+        <button id="btn-connect" class="primary">Conectar</button>
+        <button id="btn-disconnect" class="secondary" disabled>Desconectar</button>
+      </div>
+      <div class="row config-row">
+        <label for="ovpn-path">Archivo .ovpn</label>
+        <input id="ovpn-path" type="text" placeholder="Ruta al archivo .ovpn" spellcheck="false">
+        <button id="btn-browse" class="ghost">Examinar</button>
+        <button id="btn-save-config" class="ghost">Guardar</button>
+      </div>
+    </section>
+
+    <section class="card metrics-card">
+      <h2>Métricas</h2>
+      <div class="metrics-grid">
+        <div class="metric">
+          <div class="metric-label">↓ Recibido</div>
+          <div class="metric-value" id="m-rx">0 B</div>
+          <div class="metric-sub" id="m-rx-rate">0 B/s</div>
+        </div>
+        <div class="metric">
+          <div class="metric-label">↑ Enviado</div>
+          <div class="metric-value" id="m-tx">0 B</div>
+          <div class="metric-sub" id="m-tx-rate">0 B/s</div>
+        </div>
+        <div class="metric">
+          <div class="metric-label">TUN</div>
+          <div class="metric-value" id="m-tun">—</div>
+          <div class="metric-sub" id="m-since">—</div>
+        </div>
+        <div class="metric">
+          <div class="metric-label">Servidor</div>
+          <div class="metric-value" id="m-server">—</div>
+          <div class="metric-sub" id="m-state">—</div>
+        </div>
+      </div>
+    </section>
+
+    <section class="card logs-card">
+      <h2>Logs</h2>
+      <pre id="logs" aria-live="polite"></pre>
+    </section>
+  </main>
+
+  <div id="modal" class="modal-overlay hidden" role="dialog" aria-modal="true">
+    <div class="modal">
+      <h3 id="modal-title">Autenticación</h3>
+      <p id="modal-message"></p>
+      <form id="modal-form">
+        <input id="modal-input" type="text" autocomplete="off">
+        <label id="modal-remember-label" class="remember hidden">
+          <input id="modal-remember" type="checkbox"> Recordar credenciales
+        </label>
+        <div class="row right">
+          <button type="button" id="modal-cancel" class="ghost">Cancelar</button>
+          <button type="submit" class="primary">Enviar</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <script src="./app.js" defer></script>
+</body>
+</html>

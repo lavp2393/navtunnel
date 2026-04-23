@@ -166,11 +166,10 @@
     const rawMax = Math.max(1, ...rxBuf, ...txBuf);
     const max = niceMax(rawMax * 1.15);
 
-    function drawSeries(buf, stroke, fill, glow) {
-      ctx.save();
-      ctx.shadowBlur = glow;
-      ctx.shadowColor = stroke;
-
+    // drawSeries dibuja área + línea sin shadowBlur: shadowBlur es O(pixels
+     // × radio) y en webkit2gtk sin GPU mata la fluidez. El glow se falsea
+     // con una segunda pasada más clara y más gruesa debajo de la principal.
+    function drawSeries(buf, stroke, strokeSoft, fill) {
       // Área bajo la línea.
       ctx.beginPath();
       for (let i = 0; i < buf.length; i++) {
@@ -185,7 +184,20 @@
       ctx.fillStyle = fill;
       ctx.fill();
 
-      // Línea.
+      // Línea de glow (gruesa, difusa).
+      ctx.beginPath();
+      for (let i = 0; i < buf.length; i++) {
+        const x = (i / (buf.length - 1)) * w;
+        const y = h - (buf[i] / max) * h * 0.92;
+        if (i === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      }
+      ctx.strokeStyle = strokeSoft;
+      ctx.lineWidth = 5 * dpr;
+      ctx.lineJoin = "round";
+      ctx.stroke();
+
+      // Línea principal.
       ctx.beginPath();
       for (let i = 0; i < buf.length; i++) {
         const x = (i / (buf.length - 1)) * w;
@@ -197,20 +209,19 @@
       ctx.lineWidth = 2 * dpr;
       ctx.lineJoin = "round";
       ctx.stroke();
-      ctx.restore();
     }
 
     // RX (cian)
     const gradRx = ctx.createLinearGradient(0, 0, 0, h);
-    gradRx.addColorStop(0, "rgba(0, 240, 255, 0.35)");
+    gradRx.addColorStop(0, "rgba(0, 240, 255, 0.28)");
     gradRx.addColorStop(1, "rgba(0, 240, 255, 0)");
-    drawSeries(rxBuf, "rgba(0, 240, 255, 0.95)", gradRx, 12 * dpr);
+    drawSeries(rxBuf, "rgba(0, 240, 255, 1)", "rgba(0, 240, 255, 0.25)", gradRx);
 
     // TX (magenta)
     const gradTx = ctx.createLinearGradient(0, 0, 0, h);
-    gradTx.addColorStop(0, "rgba(255, 61, 160, 0.30)");
+    gradTx.addColorStop(0, "rgba(255, 61, 160, 0.24)");
     gradTx.addColorStop(1, "rgba(255, 61, 160, 0)");
-    drawSeries(txBuf, "rgba(255, 61, 160, 0.95)", gradTx, 12 * dpr);
+    drawSeries(txBuf, "rgba(255, 61, 160, 1)", "rgba(255, 61, 160, 0.25)", gradTx);
 
     // Etiqueta Y del pico en la esquina.
     ctx.save();

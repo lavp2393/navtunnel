@@ -42,15 +42,11 @@ html, body {
   background-size: 48px 48px;
   z-index: -2;
 }
-
-.bg-glow {
-  position: fixed; inset: 0;
-  background:
-    radial-gradient(1000px 500px at 10% -5%, rgba(255, 61, 160, 0.16), transparent 60%),
-    radial-gradient(1200px 600px at 110% 110%, rgba(0, 240, 255, 0.18), transparent 55%);
-  z-index: -1;
-  pointer-events: none;
-}
+/* bg-glow con radial-gradients fue removido: dos radial-gradients
+   fullscreen fuerzan repaint completo en webkit2gtk sin GPU y degradan
+   la fluidez del canvas. El tema queda igual con el grid y los glows
+   localizados en botones/modales. */
+.bg-glow { display: none; }
 
 /* --- Topbar ----------------------------------------------------------- */
 
@@ -60,18 +56,15 @@ html, body {
   align-items: center;
   padding: 18px 26px;
   border-bottom: 1px solid var(--border);
-  backdrop-filter: blur(14px);
-  background: linear-gradient(180deg, rgba(10, 10, 25, 0.7), rgba(10, 10, 25, 0.35));
+  background: #0a0a1a;
   position: sticky; top: 0; z-index: 10;
 }
 
 .brand { display: flex; align-items: center; gap: 14px; }
 .brand-mark {
   font-size: 24px; color: var(--cyan);
-  text-shadow: 0 0 16px var(--cyan);
-  animation: spin 8s linear infinite;
+  text-shadow: 0 0 10px rgba(0, 240, 255, 0.6);
 }
-@keyframes spin { to { transform: rotate(360deg); } }
 
 .brand-title {
   font-weight: 600; letter-spacing: 0.22em; font-size: 15px;
@@ -149,18 +142,10 @@ main {
 
 .card {
   position: relative;
-  background: var(--panel);
+  background: #10122a;
   border: 1px solid var(--border);
   border-radius: 6px;
   padding: 16px;
-  backdrop-filter: blur(10px);
-}
-.card::before {
-  content: "";
-  position: absolute; inset: 0;
-  background: linear-gradient(120deg, transparent 0%, transparent 40%, rgba(0, 240, 255, 0.04) 50%, transparent 60%);
-  pointer-events: none;
-  border-radius: inherit;
 }
 
 .card-header {
@@ -359,11 +344,10 @@ button:disabled { opacity: 0.35; cursor: not-allowed; box-shadow: none; }
 
 .modal-overlay {
   position: fixed; inset: 0;
-  background: rgba(3, 3, 12, 0.78);
+  background: rgba(3, 3, 12, 0.88);
   display: flex;
   align-items: center; justify-content: center;
   z-index: 100;
-  backdrop-filter: blur(8px);
   animation: fadeIn 0.15s ease-out;
 }
 .modal-overlay.hidden { display: none; }
@@ -376,9 +360,7 @@ button:disabled { opacity: 0.35; cursor: not-allowed; box-shadow: none; }
   padding: 22px;
   min-width: 400px;
   max-width: 92vw;
-  box-shadow:
-    0 0 60px rgba(0, 240, 255, 0.3),
-    inset 0 0 30px rgba(0, 240, 255, 0.05);
+  box-shadow: 0 0 24px rgba(0, 240, 255, 0.25);
   animation: slideIn 0.18s ease-out;
 }
 @keyframes slideIn {

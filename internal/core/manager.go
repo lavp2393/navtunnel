@@ -76,10 +76,11 @@ type Manager struct {
 	conn   net.Conn
 	reader *bufio.Reader
 
-	events   chan Event
-	stopCh   chan struct{}
-	stopOnce sync.Once
-	wg       sync.WaitGroup
+	events     chan Event
+	stopCh     chan struct{}
+	stopOnce   sync.Once
+	wg         sync.WaitGroup
+	procExited chan struct{} // se cierra cuando cmd.Wait() retorna
 
 	writeMu sync.Mutex // Serializa escrituras al socket.
 
@@ -158,6 +159,7 @@ func Start(ovpnPath, openvpnBinary string) (*Manager, error) {
 		reader:     bufio.NewReader(conn),
 		events:     make(chan Event, 256),
 		stopCh:     make(chan struct{}),
+		procExited: make(chan struct{}),
 		pwFilePath: pwFile,
 		metrics:    newMetricsStore(),
 	}
@@ -199,14 +201,29 @@ func (m *Manager) SendFunctions() SendFns {
 }
 
 // Stop termina el proceso OpenVPN y cierra el manager. Es idempotente.
+// Intenta cierre limpio vía "signal SIGTERM" por el management socket — esto
+// es lo único que funciona en macOS, donde matar el proceso padre (osascript)
+// no propaga la señal al openvpn elevado.
 func (m *Manager) Stop() {
 	m.stopOnce.Do(func() {
 		close(m.stopCh)
+
+		// Pedir shutdown limpio a openvpn. Si el socket ya está cerrado, sigue.
+		if m.conn != nil {
+			_ = m.writeCommandIgnoreStop("signal SIGTERM")
+		}
+
+		// Esperar a que el proceso salga solo; si no lo hace en 3 s, forzar.
+		select {
+		case <-m.procExited:
+		case <-time.After(3 * time.Second):
+			if m.cmd != nil && m.cmd.Process != nil {
+				_ = m.cmd.Process.Kill()
+			}
+		}
+
 		if m.conn != nil {
 			_ = m.conn.Close()
-		}
-		if m.cmd != nil && m.cmd.Process != nil {
-			_ = m.cmd.Process.Kill()
 		}
 		if m.pwFilePath != "" {
 			_ = os.Remove(m.pwFilePath)
@@ -214,6 +231,18 @@ func (m *Manager) Stop() {
 		m.wg.Wait()
 		close(m.events)
 	})
+}
+
+// writeCommandIgnoreStop escribe sin revisar stopCh. Solo lo usamos durante
+// Stop() para enviar "signal SIGTERM" justo después de cerrar stopCh.
+func (m *Manager) writeCommandIgnoreStop(cmd string) error {
+	m.writeMu.Lock()
+	defer m.writeMu.Unlock()
+	if m.conn == nil {
+		return fmt.Errorf("socket no disponible")
+	}
+	_, err := m.conn.Write([]byte(cmd + "\n"))
+	return err
 }
 
 // --- Autenticación del socket management ------------------------------------
@@ -479,6 +508,8 @@ func validateCredInput(s string) error {
 
 func (m *Manager) waitProcess() {
 	defer m.wg.Done()
+	defer close(m.procExited)
+
 	err := m.cmd.Wait()
 	msg := "Proceso OpenVPN terminado"
 	var exitErr *exec.ExitError

@@ -2,7 +2,9 @@ package core
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"strings"
@@ -45,6 +47,7 @@ type Manager struct {
 	ptmx         *os.File // Pseudo-terminal master
 	events       chan Event
 	stopCh       chan struct{}
+	stopOnce     sync.Once
 	wg           sync.WaitGroup
 	currentStage string // "username", "password", "otp"
 	mu           sync.Mutex
@@ -88,22 +91,47 @@ func Start(ovpnPath string, openvpnBinary string) (*Manager, error) {
 		stopCh: make(chan struct{}),
 	}
 
-	// 4. Iniciar el lector del PTY en una goroutine
-	m.wg.Add(1)
+	// 4. Iniciar las goroutines de I/O
+	m.wg.Add(2)
 	go m.readPTY()
-
-	// Goroutine para manejar el fin del proceso
-	go func() {
-		m.cmd.Wait()
-		// Si el proceso termina, avisamos
-		select {
-		case m.events <- Event{Type: EventDisconnected, Message: "Proceso OpenVPN terminado"}:
-		case <-m.stopCh:
-		}
-		m.Stop() // Asegurarse de cerrar todo
-	}()
+	go m.waitProcess()
 
 	return m, nil
+}
+
+// waitProcess espera a que el proceso termine y emite el evento correspondiente.
+// Se contabiliza en m.wg para que Stop() pueda esperarla sin carreras al cerrar events.
+func (m *Manager) waitProcess() {
+	defer m.wg.Done()
+
+	err := m.cmd.Wait()
+	msg := "Proceso OpenVPN terminado"
+	if err != nil && !isExpectedExitError(err) {
+		msg = fmt.Sprintf("OpenVPN terminó: %v", err)
+	}
+	m.emit(Event{Type: EventDisconnected, Message: msg})
+}
+
+// isExpectedExitError devuelve true si el error de Wait() corresponde a una
+// terminación esperada (p.ej. Kill() llamado por Stop()).
+func isExpectedExitError(err error) bool {
+	var exitErr *exec.ExitError
+	return errors.As(err, &exitErr)
+}
+
+// emit envía un evento respetando stopCh y ante cierres concurrentes del canal.
+// No bloquea indefinidamente si nadie consume: si el buffer está lleno y
+// stopCh se dispara, descarta el evento.
+func (m *Manager) emit(e Event) {
+	defer func() {
+		// Si alguien cerrara m.events (no debería pasar con el diseño actual),
+		// recover evita tumbar el proceso.
+		_ = recover()
+	}()
+	select {
+	case m.events <- e:
+	case <-m.stopCh:
+	}
 }
 
 // Events retorna el canal de eventos
@@ -135,47 +163,59 @@ func (m *Manager) SendFunctions() SendFns {
 	}
 }
 
-// Stop detiene el manager y mata el proceso OpenVPN
+// Stop detiene el manager y mata el proceso OpenVPN.
+// Es idempotente y seguro de llamar desde múltiples goroutines.
+// IMPORTANTE: no toma m.mu mientras espera a las goroutines para evitar
+// deadlock con readPTY/sendCommand que también usan m.mu.
 func (m *Manager) Stop() {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.stopOnce.Do(func() {
+		close(m.stopCh)
+
+		// Cerrar el PTY desbloquea la lectura en readPTY.
+		if m.ptmx != nil {
+			_ = m.ptmx.Close()
+		}
+
+		// Matar el proceso desbloquea cmd.Wait() en waitProcess.
+		if m.cmd != nil && m.cmd.Process != nil {
+			_ = m.cmd.Process.Kill()
+		}
+
+		m.wg.Wait()
+
+		// Con readPTY y waitProcess terminadas, ya nadie emite eventos.
+		// Seguro cerrar el canal para que los consumidores detecten el fin.
+		close(m.events)
+	})
+}
+
+// sendCommand envía un comando (credencial) al PTY.
+// Rechaza valores que contengan caracteres de control de línea para evitar
+// que un usuario/contraseña/OTP con \n o \r inyecte comandos extra al PTY
+// y desincronice la máquina de estados.
+func (m *Manager) sendCommand(cmd string) error {
+	if strings.ContainsAny(cmd, "\n\r\x00") {
+		return fmt.Errorf("credencial contiene caracteres de control no permitidos")
+	}
 
 	select {
 	case <-m.stopCh:
-		// Ya está cerrado
-		return
+		return fmt.Errorf("manager detenido")
 	default:
-		close(m.stopCh)
-
-		// Cerrar el PTY primero
-		if m.ptmx != nil {
-			m.ptmx.Close()
-		}
-
-		if m.cmd != nil && m.cmd.Process != nil {
-			// Intentar terminarlo limpiamente
-			m.cmd.Process.Kill()
-		}
-		m.wg.Wait()
-		close(m.events)
 	}
-}
 
-// sendCommand envía un comando (credencial) al PTY
-func (m *Manager) sendCommand(cmd string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	if m.ptmx == nil {
 		return fmt.Errorf("PTY no está disponible")
 	}
-	// Escribimos la credencial seguida de un salto de línea
 	_, err := m.ptmx.Write([]byte(cmd + "\n"))
 	return err
 }
 
-// readPTY lee continuamente del pseudo-terminal
-// IMPORTANTE: No usamos Scanner porque los prompts de OpenVPN no tienen newline
+// readPTY lee continuamente del pseudo-terminal.
+// IMPORTANTE: No usamos Scanner porque los prompts de OpenVPN no tienen newline.
 func (m *Manager) readPTY() {
 	defer m.wg.Done()
 
@@ -188,61 +228,57 @@ func (m *Manager) readPTY() {
 		case <-m.stopCh:
 			return
 		default:
-			// Leer con timeout implícito (bloqueante pero responsive)
-			n, err := reader.Read(buf)
-			if err != nil {
-				if err.Error() != "EOF" {
-					// Error de lectura, terminar
-					return
-				}
+		}
+
+		n, err := reader.Read(buf)
+		if n > 0 {
+			buffer.Write(buf[:n])
+
+			data := buffer.String()
+			lines := strings.Split(data, "\n")
+
+			buffer.Reset()
+			if !strings.HasSuffix(data, "\n") {
+				// La última parte es incompleta; la guardamos para el próximo ciclo.
+				buffer.WriteString(lines[len(lines)-1])
+				lines = lines[:len(lines)-1]
 			}
 
-			if n > 0 {
-				chunk := string(buf[:n])
-				buffer.WriteString(chunk)
+			for _, line := range lines {
+				if line == "" {
+					continue
+				}
+				m.emit(Event{Type: EventLogLine, Message: line})
+				m.parseLine(line)
+			}
 
-				// Procesar líneas completas (con \n)
-				data := buffer.String()
-				lines := strings.Split(data, "\n")
-
-				// La última parte puede ser incompleta (sin \n)
+			// Prompts sin newline (OpenVPN los escribe sin saltar línea).
+			incomplete := buffer.String()
+			if incomplete != "" && isKnownPrompt(incomplete) {
+				m.emit(Event{Type: EventLogLine, Message: incomplete})
+				m.parseLine(incomplete)
 				buffer.Reset()
-				if !strings.HasSuffix(data, "\n") {
-					// Guardamos la línea incompleta en el buffer
-					buffer.WriteString(lines[len(lines)-1])
-					lines = lines[:len(lines)-1]
-				}
-
-				// Procesar líneas completas
-				for _, line := range lines {
-					if line != "" {
-						m.events <- Event{
-							Type:    EventLogLine,
-							Message: line,
-						}
-						m.parseLine(line)
-					}
-				}
-
-				// Procesar línea incompleta si contiene prompts conocidos
-				incomplete := buffer.String()
-				if incomplete != "" {
-					// Detectar prompts sin newline
-					if strings.Contains(incomplete, "Enter Auth Username:") ||
-						strings.Contains(incomplete, "Enter Auth Password:") ||
-						strings.Contains(incomplete, "CHALLENGE:") ||
-						strings.HasSuffix(incomplete, "Response:") {
-						m.events <- Event{
-							Type:    EventLogLine,
-							Message: incomplete,
-						}
-						m.parseLine(incomplete)
-						buffer.Reset()
-					}
-				}
 			}
 		}
+
+		if err != nil {
+			// io.EOF o PTY cerrado: el proceso terminó o Stop() cerró el PTY.
+			// En cualquier caso, salir; waitProcess emitirá EventDisconnected.
+			if errors.Is(err, io.EOF) || errors.Is(err, os.ErrClosed) {
+				return
+			}
+			// Cualquier otro error también es terminal para esta goroutine.
+			return
+		}
 	}
+}
+
+// isKnownPrompt detecta fragmentos sin newline que ya son accionables.
+func isKnownPrompt(s string) bool {
+	return strings.Contains(s, "Enter Auth Username:") ||
+		strings.Contains(s, "Enter Auth Password:") ||
+		strings.Contains(s, "CHALLENGE:") ||
+		strings.HasSuffix(s, "Response:")
 }
 
 // parseLine "raspa" la salida de la consola para encontrar prompts
@@ -252,43 +288,35 @@ func (m *Manager) parseLine(line string) {
 	// --- Lógica de Detección de Prompts (Basada en tu captura) ---
 
 	// 1. Pedir Usuario
-	// Cambiado de HasSuffix a Contains porque OpenVPN imprime el input en la misma línea
 	if strings.Contains(line, "Enter Auth Username:") {
 		m.mu.Lock()
 		m.currentStage = "username"
 		m.mu.Unlock()
-		m.events <- Event{
-			Type:    EventAskUser,
-			Message: "Ingresa tu usuario corporativo",
-		}
+		m.emit(Event{Type: EventAskUser, Message: "Ingresa tu usuario corporativo"})
 		return
 	}
 
 	// 2. Pedir Contraseña
-	// Cambiado de HasSuffix a Contains porque OpenVPN imprime el input en la misma línea
 	if strings.Contains(line, "Enter Auth Password:") {
 		m.mu.Lock()
 		m.currentStage = "password"
 		m.mu.Unlock()
-		m.events <- Event{
-			Type:    EventAskPass,
-			Message: "Ingresa tu contraseña",
-		}
+		m.emit(Event{Type: EventAskPass, Message: "Ingresa tu contraseña"})
 		return
 	}
 
-	// 3. Pedir OTP - Múltiples variaciones posibles
-	// Detectar diferentes formatos de challenge de OTP
+	// 3. Pedir OTP — variaciones conocidas de OpenVPN.
+	// Se usan prefijos/sufijos específicos para evitar falsos positivos
+	// como "Cannot enter OTP mode".
 	if strings.HasPrefix(line, "CHALLENGE:") ||
 		strings.Contains(line, "static challenge") ||
 		strings.Contains(line, "Static challenge") ||
-		(strings.Contains(line, "OTP") && strings.Contains(line, "Enter")) ||
+		strings.Contains(line, "Enter OTP:") ||
 		strings.HasSuffix(line, "Response:") {
 		m.mu.Lock()
 		m.currentStage = "otp"
 		m.mu.Unlock()
 
-		// Extraer el mensaje del challenge si queremos
 		msg := "Ingresa tu código OTP"
 		if strings.HasPrefix(line, "CHALLENGE:") {
 			parts := strings.SplitN(line, ":", 2)
@@ -297,10 +325,7 @@ func (m *Manager) parseLine(line string) {
 			}
 		}
 
-		m.events <- Event{
-			Type:    EventAskOTP,
-			Message: msg,
-		}
+		m.emit(Event{Type: EventAskOTP, Message: msg})
 		return
 	}
 
@@ -312,30 +337,23 @@ func (m *Manager) parseLine(line string) {
 		stage := m.currentStage
 		m.mu.Unlock()
 
-		m.events <- Event{
+		m.emit(Event{
 			Type:    EventAuthFailed,
 			Message: getAuthFailedMessage(stage),
 			Stage:   stage,
-		}
+		})
 		return
 	}
 
 	// 5. Conexión Exitosa
-	// Este es el mensaje más común cuando la VPN se establece
 	if strings.Contains(line, "Initialization Sequence Completed") {
-		m.events <- Event{
-			Type:    EventConnected,
-			Message: "Conexión establecida ✅",
-		}
+		m.emit(Event{Type: EventConnected, Message: "Conexión establecida"})
 		return
 	}
 
 	// 6. Error Fatal
 	if strings.HasPrefix(line, "FATAL:") {
-		m.events <- Event{
-			Type:    EventFatal,
-			Message: strings.TrimPrefix(line, "FATAL:"),
-		}
+		m.emit(Event{Type: EventFatal, Message: strings.TrimPrefix(line, "FATAL:")})
 		return
 	}
 }
@@ -358,19 +376,3 @@ func getAuthFailedMessage(stage string) string {
 	}
 }
 
-// FindFreePort ya no es necesario para este método.
-// Lo comento por si lo necesitas en otro lado, pero este manager no lo usa.
-/*
-func FindFreePort() (int, error) {
-        rand.Seed(time.Now().UnixNano())
-        for i := 0; i < 10; i++ {
-                port := 49152 + rand.Intn(65535-49152)
-                ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
-                if err == nil {
-                        ln.Close()
-                        return port, nil
-                }
-        }
-        return 0, fmt.Errorf("no se pudo encontrar un puerto libre")
-}
-*/

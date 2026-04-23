@@ -67,21 +67,16 @@ func (b *Buffer) Count() int {
 	return len(b.lines)
 }
 
-// sanitizeLine elimina información sensible de las líneas de log
+// sanitizeLine elimina información sensible de las líneas de log.
+// Solo filtra formatos conocidos de comandos al management interface
+// ("username <algo> <secreto>", "password <algo> <secreto>") para no
+// destruir líneas legítimas de OpenVPN que mencionen la palabra "password".
 func sanitizeLine(line string) string {
-	// No mostrar valores enviados en username/password
-	// Estos comandos se envían al management interface
 	if strings.HasPrefix(line, "username ") || strings.HasPrefix(line, "password ") {
 		parts := strings.Fields(line)
-		if len(parts) >= 2 {
+		if len(parts) >= 3 {
 			return parts[0] + " " + parts[1] + " ********"
 		}
 	}
-
-	// No mostrar contraseñas en respuestas
-	if strings.Contains(line, "password") || strings.Contains(line, "Password") {
-		return strings.ReplaceAll(line, line, "[REDACTED]")
-	}
-
 	return line
 }

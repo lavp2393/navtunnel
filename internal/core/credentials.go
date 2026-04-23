@@ -12,7 +12,7 @@ import (
 
 const (
 	// serviceName identifica a la aplicación dentro del keyring
-	serviceName = "PreyVPN"
+	serviceName = "NavTunnel"
 	// keyringUser es el identificador único para las credenciales almacenadas
 	keyringUser = "credentials"
 )
@@ -212,9 +212,9 @@ func fallbackPath(createDir bool) (string, error) {
 			}
 			return "", herr
 		}
-		configDir = filepath.Join(home, ".preyvpn")
+		configDir = filepath.Join(home, ".navtunnel")
 	} else {
-		configDir = filepath.Join(configDir, "PreyVPN")
+		configDir = filepath.Join(configDir, "NavTunnel")
 	}
 
 	if createDir {

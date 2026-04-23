@@ -36,8 +36,8 @@ func getConfigPath() (string, error) {
 
 	configDir := filepath.Join(configHome, "NavTunnel")
 
-	// Crear directorio si no existe
-	if err := os.MkdirAll(configDir, 0755); err != nil {
+	// Crear directorio si no existe con permisos restrictivos (solo el usuario)
+	if err := os.MkdirAll(configDir, 0o700); err != nil {
 		return "", err
 	}
 
@@ -84,7 +84,7 @@ func (c *Config) Save() error {
 		return err
 	}
 
-	return os.WriteFile(configPath, data, 0644)
+	return os.WriteFile(configPath, data, 0o600)
 }
 
 // HasVPNConfig verifica si hay un archivo .ovpn configurado

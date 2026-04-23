@@ -3,624 +3,703 @@ package ui
 import (
 	"errors"
 	"fmt"
-	"os"
+	"image/color"
 	"path/filepath"
+	"strings"
 	"sync"
+
+	"fyne.io/fyne/v2"
+	fyneApp "fyne.io/fyne/v2/app"
+	"fyne.io/fyne/v2/canvas"
+	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/dialog"
+	"fyne.io/fyne/v2/layout"
+	"fyne.io/fyne/v2/storage"
+	"fyne.io/fyne/v2/widget"
 
 	"github.com/lavp2393/navtunnel/internal/config"
 	"github.com/lavp2393/navtunnel/internal/core"
 	"github.com/lavp2393/navtunnel/internal/logs"
 	"github.com/lavp2393/navtunnel/internal/tray"
-
-	"fyne.io/fyne/v2"
-	"fyne.io/fyne/v2/app"
-	"fyne.io/fyne/v2/container"
-	"fyne.io/fyne/v2/dialog"
-	"fyne.io/fyne/v2/storage"
-	"fyne.io/fyne/v2/widget"
 )
 
-// AppState representa el estado de la aplicación
-type AppState int
-
-const (
-	StateDisconnected AppState = iota
-	StateConnecting
-	StateAuthenticating
-	StateConnected
-	StateError
-)
-
-// App representa la aplicación principal
+// App es la aplicación principal: arma la ventana Fyne con el dashboard,
+// integra el tray nativo y controla el Manager de core.
 type App struct {
-	fyneApp   fyne.App
-	window    fyne.Window
-	state     AppState
-	logBuffer *logs.Buffer
-	trayIcon  *tray.Systray
-	config    *config.Config
+	fyneApp fyne.App
+	window  fyne.Window
 
-	// Thread-safety for state
-	stateMutex sync.RWMutex
+	cfg     *config.Config
+	logBuf  *logs.Buffer
+	tray    *tray.Systray
 
-	// UI elements
-	statusLabel   *widget.Label
-	connectBtn    *widget.Button
-	disconnectBtn *widget.Button
-	retryBtn      *widget.Button
-	changeFileBtn *widget.Button
-	logView       *widget.Entry
-	configStatus  *widget.Label
-
-	// Core components
+	mu      sync.Mutex
 	manager *core.Manager
 	sendFns core.SendFns
 
-	// Credentials cache (in-memory for current session)
-	savedUsername string
-	savedPassword string
+	credMu        sync.Mutex
+	savedUser     string
+	savedPass     string
 	rememberCreds bool
 	credStore     core.CredentialStoreMethod
+
+	// Widgets del dashboard.
+	statusDot    *canvas.Circle
+	statusLabel  *widget.Label
+	connectBtn   *widget.Button
+	disconBtn    *widget.Button
+	ovpnEntry    *widget.Entry
+	rxTotal      *widget.Label
+	txTotal      *widget.Label
+	rxRate       *widget.Label
+	txRate       *widget.Label
+	tunLabel     *widget.Label
+	serverLabel  *widget.Label
+	chart        *TrafficChart
+	logsBox      *widget.Entry
+
+	// Modal de credenciales activo (para evitar múltiples abiertos al mismo
+	// tiempo y cancelar si el flow cambia).
+	promptMu     sync.Mutex
+	promptActive bool
 }
 
-// NewApp crea una nueva instancia de la aplicación
+// NewApp construye y configura la aplicación sin arrancarla todavía.
 func NewApp() *App {
 	a := &App{
-		fyneApp:   app.New(),
-		logBuffer: logs.NewBuffer(30),
-		state:     StateDisconnected,
+		fyneApp: fyneApp.NewWithID("com.preyhq.navtunnel"),
+		logBuf:  logs.NewBuffer(400),
 	}
+	a.fyneApp.Settings().SetTheme(&cyberpunkTheme{})
 
-	// Cargar o crear configuración
 	cfg, err := config.Load()
-	if err != nil {
-		if errors.Is(err, config.ErrConfigNotFound) {
-			// Primera ejecución - crear configuración por defecto
-			cfg = config.Default()
-		} else {
-			// Error cargando configuración
-			cfg = config.Default()
-		}
+	if err != nil && !errors.Is(err, config.ErrConfigNotFound) {
+		// No es crítico: seguimos con default y el usuario corrige desde la UI.
+		a.logBuf.Add("Aviso: " + err.Error())
 	}
-	a.config = cfg
+	if cfg == nil {
+		cfg = config.Default()
+	}
+	a.cfg = cfg
 
 	a.window = a.fyneApp.NewWindow("NavTunnel")
-	a.window.Resize(fyne.NewSize(700, 500))
-
-	// Configurar comportamiento al cerrar: minimizar a tray en vez de salir
-	a.window.SetCloseIntercept(func() {
-		a.window.Hide()
-	})
+	a.window.Resize(fyne.NewSize(920, 720))
+	a.window.SetCloseIntercept(func() { a.window.Hide() })
 
 	a.buildUI()
-	a.initializeStoredCredentials()
-	a.setupTrayIcon()
-
-	// Si no hay archivo .ovpn configurado, mostrar file picker
-	if !a.config.HasVPNConfig() || !a.config.IsVPNConfigValid() {
-		a.showWelcomeDialog()
-	}
+	a.loadStoredCredentials()
+	a.setupTray()
 
 	return a
 }
 
-// setupTrayIcon configura el icono de system tray
-func (a *App) setupTrayIcon() {
-	callbacks := tray.MenuCallbacks{
-		OnConnect: func() {
-			a.window.Show() // Mostrar ventana primero
-			a.onConnect()
-		},
-		OnDisconnect: func() {
-			a.onDisconnect()
-		},
-		OnShowWindow: func() {
-			a.window.Show()
-			a.window.RequestFocus()
-		},
-		OnQuit: func() {
-			// Desconectar si está conectado
-			if a.manager != nil {
-				a.manager.Stop()
-			}
-			a.fyneApp.Quit()
-		},
-	}
+// Run arranca el tray en goroutine y Fyne en el main thread (requerido por
+// macOS); bloquea hasta que el usuario elige Salir.
+func (a *App) Run() {
+	go a.tray.Run(func() {
+		a.setStatus("Desconectado", statusIdle)
+	}, nil)
 
-	a.trayIcon = tray.NewSystray(callbacks)
-	// NO llamar updateTrayIcon() aquí - el tray aún no está inicializado
+	a.window.Show()
+	a.fyneApp.Run()
+
+	if a.tray != nil {
+		a.tray.Quit()
+	}
+	a.disconnect()
 }
 
-// buildUI construye la interfaz de usuario
+// --- UI ---------------------------------------------------------------------
+
 func (a *App) buildUI() {
-	// Status label
-	a.statusLabel = widget.NewLabel("Estado: Desconectado")
-	a.statusLabel.Wrapping = fyne.TextWrapWord
+	// Header: logo + estado.
+	a.statusDot = canvas.NewCircle(colorDim)
+	a.statusDot.Resize(fyne.NewSize(12, 12))
+	a.statusDot.StrokeWidth = 0
+	statusDotBox := container.NewWithoutLayout(a.statusDot)
+	statusDotBox.Resize(fyne.NewSize(14, 14))
 
-	// Config status
-	a.configStatus = widget.NewLabel("")
+	a.statusLabel = widget.NewLabel("DESCONECTADO")
+	a.statusLabel.TextStyle = fyne.TextStyle{Bold: true, Monospace: true}
 
-	// Buttons
-	a.connectBtn = widget.NewButton("Conectar", a.onConnect)
-	a.disconnectBtn = widget.NewButton("Desconectar", a.onDisconnect)
-	a.disconnectBtn.Disable()
+	title := canvas.NewText("NAVTUNNEL", colorCyan)
+	title.TextStyle = fyne.TextStyle{Bold: true}
+	title.TextSize = 16
+	subtitle := canvas.NewText("SECURE CHANNEL", colorDim)
+	subtitle.TextSize = 9
+	subtitle.TextStyle = fyne.TextStyle{Monospace: true}
 
-	a.retryBtn = widget.NewButton("Reintentar", func() {
-		a.updateConfigStatus()
-		if a.config.IsVPNConfigValid() {
-			a.connectBtn.Enable()
-			a.retryBtn.Hide()
-		}
-	})
-	a.retryBtn.Hide()
-
-	a.changeFileBtn = widget.NewButton("Cambiar archivo VPN", func() {
-		a.showFilePicker()
-	})
-
-	// Actualizar estado del config después de crear todos los widgets
-	a.updateConfigStatus()
-
-	// Log view (read-only)
-	a.logView = widget.NewMultiLineEntry()
-	a.logView.Disable() // Read-only
-	a.logView.SetPlaceHolder("Los logs aparecerán aquí...")
-
-	// Layout
-	buttonBox := container.NewHBox(
-		a.connectBtn,
-		a.disconnectBtn,
-		a.retryBtn,
-		a.changeFileBtn,
-	)
-
-	content := container.NewBorder(
-		container.NewVBox(
-			widget.NewLabel("NavTunnel - Cliente OpenVPN"),
-			widget.NewSeparator(),
-			a.configStatus,
-			a.statusLabel,
-			buttonBox,
-			widget.NewSeparator(),
-			widget.NewLabel("Logs:"),
+	header := container.NewBorder(
+		nil, nil,
+		container.NewHBox(
+			canvas.NewText("◈", colorCyan),
+			container.NewVBox(title, subtitle),
 		),
+		container.NewHBox(statusDotBox, a.statusLabel),
 		nil,
-		nil,
-		nil,
-		container.NewScroll(a.logView),
 	)
 
-	a.window.SetContent(content)
+	// Chart de tráfico.
+	a.chart = NewTrafficChart(fyne.NewSize(600, 220))
+	chartTitle := canvas.NewText("TRÁFICO EN VIVO", colorCyan)
+	chartTitle.TextStyle = fyne.TextStyle{Monospace: true, Bold: true}
+	chartTitle.TextSize = 11
+
+	a.rxRate = newMetricValue("0 B/s", colorCyan)
+	a.txRate = newMetricValue("0 B/s", colorMagenta)
+	rateRow := container.NewGridWithColumns(2,
+		newMetricBox("↓ RX RATE", a.rxRate),
+		newMetricBox("↑ TX RATE", a.txRate),
+	)
+
+	chartCard := newCard(container.NewBorder(
+		chartTitle, rateRow, nil, nil,
+		a.chart,
+	))
+
+	// Grid 2x2 de métricas totales.
+	a.rxTotal = newMetricValue("0 B", nil)
+	a.txTotal = newMetricValue("0 B", nil)
+	a.tunLabel = newMetricValue("—", nil)
+	a.serverLabel = newMetricValue("—", nil)
+
+	metricGrid := container.NewGridWithColumns(4,
+		newCard(newMetricBox("TOTAL RX", a.rxTotal)),
+		newCard(newMetricBox("TOTAL TX", a.txTotal)),
+		newCard(newMetricBox("TUN IP", a.tunLabel)),
+		newCard(newMetricBox("SERVIDOR", a.serverLabel)),
+	)
+
+	// Controls: conectar/desconectar + config.
+	a.connectBtn = widget.NewButton("◉ CONECTAR", a.onConnect)
+	a.connectBtn.Importance = widget.HighImportance
+	a.disconBtn = widget.NewButton("⊗ DESCONECTAR", a.onDisconnect)
+	a.disconBtn.Disable()
+
+	a.ovpnEntry = widget.NewEntry()
+	a.ovpnEntry.PlaceHolder = "/ruta/al/archivo.ovpn"
+	a.ovpnEntry.SetText(a.cfg.VPNConfigPath)
+
+	browseBtn := widget.NewButton("EXAMINAR", a.onBrowse)
+	saveBtn := widget.NewButton("GUARDAR", a.onSaveConfig)
+
+	btnRow := container.NewHBox(a.connectBtn, a.disconBtn)
+	cfgRow := container.NewBorder(nil, nil,
+		widget.NewLabelWithStyle("OVPN", fyne.TextAlignLeading, fyne.TextStyle{Monospace: true, Bold: true}),
+		container.NewHBox(browseBtn, saveBtn),
+		a.ovpnEntry,
+	)
+	controlsCard := newCard(container.NewVBox(btnRow, widget.NewSeparator(), cfgRow))
+
+	// Dashboard container.
+	dashboard := container.NewVBox(
+		chartCard,
+		metricGrid,
+		controlsCard,
+	)
+
+	// Logs tab.
+	a.logsBox = widget.NewMultiLineEntry()
+	a.logsBox.Disable()
+	a.logsBox.TextStyle = fyne.TextStyle{Monospace: true}
+	a.logsBox.Wrapping = fyne.TextWrapOff
+	logsScroll := container.NewScroll(a.logsBox)
+	logsCard := newCard(container.NewBorder(
+		container.NewHBox(
+			monoTitle("LOG STREAM"),
+			layout.NewSpacer(),
+			widget.NewButton("LIMPIAR", func() {
+				a.logBuf.Clear()
+				a.logsBox.SetText("")
+			}),
+		),
+		nil, nil, nil, logsScroll,
+	))
+
+	tabs := container.NewAppTabs(
+		container.NewTabItem("Dashboard", container.NewPadded(dashboard)),
+		container.NewTabItem("Logs", container.NewPadded(logsCard)),
+	)
+	tabs.SetTabLocation(container.TabLocationTop)
+
+	root := container.NewBorder(
+		container.NewPadded(header),
+		nil, nil, nil,
+		tabs,
+	)
+	a.window.SetContent(root)
 }
 
-// initializeStoredCredentials intenta recuperar credenciales guardadas y actualiza el estado interno
-func (a *App) initializeStoredCredentials() {
-	username, password, method, warning, err := core.LoadCredentials()
-	if err == nil {
-		a.savedUsername = username
-		a.savedPassword = password
-		a.rememberCreds = true
-		a.credStore = method
-		a.logCredentialLoad(method)
-		if warning != "" {
-			a.addLog("Aviso: " + warning)
+// newCard envuelve el contenido con un borde sutil para "cards" tipo panel.
+func newCard(content fyne.CanvasObject) fyne.CanvasObject {
+	bg := canvas.NewRectangle(colorPanel)
+	bg.StrokeColor = color.NRGBA{0x78, 0xDC, 0xFF, 0x2E}
+	bg.StrokeWidth = 1
+	return container.NewStack(bg, container.NewPadded(content))
+}
+
+// newMetricBox arma un bloque (etiqueta monoespaciada + valor).
+func newMetricBox(label string, value *widget.Label) fyne.CanvasObject {
+	l := canvas.NewText(label, colorDim)
+	l.TextStyle = fyne.TextStyle{Monospace: true, Bold: true}
+	l.TextSize = 10
+	return container.NewVBox(l, value)
+}
+
+// newMetricValue construye un label estilo display numérico.
+func newMetricValue(text string, c color.Color) *widget.Label {
+	lbl := widget.NewLabel(text)
+	lbl.TextStyle = fyne.TextStyle{Monospace: true, Bold: true}
+	return lbl
+}
+
+func monoTitle(s string) fyne.CanvasObject {
+	t := canvas.NewText(s, colorCyan)
+	t.TextStyle = fyne.TextStyle{Monospace: true, Bold: true}
+	t.TextSize = 11
+	return t
+}
+
+// --- Tray -------------------------------------------------------------------
+
+func (a *App) setupTray() {
+	a.tray = tray.NewSystray(tray.MenuCallbacks{
+		OnConnect:    func() { fyne.Do(a.onConnect) },
+		OnDisconnect: func() { fyne.Do(a.onDisconnect) },
+		OnShowWindow: func() { fyne.Do(func() { a.window.Show() }) },
+		OnQuit: func() {
+			fyne.Do(func() {
+				a.disconnect()
+				a.fyneApp.Quit()
+			})
+		},
+	})
+}
+
+// --- Status / métricas ------------------------------------------------------
+
+type statusKind int
+
+const (
+	statusIdle statusKind = iota
+	statusWait
+	statusOK
+	statusErr
+)
+
+func (a *App) setStatus(text string, kind statusKind) {
+	fyne.Do(func() {
+		a.statusLabel.SetText(strings.ToUpper(text))
+		switch kind {
+		case statusOK:
+			a.statusDot.FillColor = color.NRGBA{0x00, 0xFF, 0xA3, 0xFF}
+			a.tray.SetIcon(tray.IconConnected)
+			a.tray.UpdateState(text, true)
+		case statusWait:
+			a.statusDot.FillColor = color.NRGBA{0xFF, 0xB8, 0x4D, 0xFF}
+			a.tray.SetIcon(tray.IconConnecting)
+			a.tray.UpdateState(text, false)
+		case statusErr:
+			a.statusDot.FillColor = color.NRGBA{0xFF, 0x4D, 0x6D, 0xFF}
+			a.tray.SetIcon(tray.IconError)
+			a.tray.UpdateState(text, false)
+		default:
+			a.statusDot.FillColor = colorDim
+			a.tray.SetIcon(tray.IconDisconnected)
+			a.tray.UpdateState(text, false)
 		}
-		return
-	}
-
-	if warning != "" {
-		a.addLog("Aviso: " + warning)
-	}
-
-	if errors.Is(err, core.ErrCredentialsNotFound) {
-		return
-	}
-
-	a.addLog("Advertencia: No se pudieron cargar credenciales guardadas: " + err.Error())
+		canvas.Refresh(a.statusDot)
+	})
 }
 
-// updateConfigStatus actualiza el estado del archivo de configuración
-func (a *App) updateConfigStatus() {
-	if a.config.IsVPNConfigValid() {
-		fileName := filepath.Base(a.config.VPNConfigPath)
-		a.configStatus.SetText(fmt.Sprintf("✅ Archivo VPN: %s", fileName))
-		a.connectBtn.Enable()
-		a.retryBtn.Hide()
-		a.changeFileBtn.Show()
-	} else if a.config.HasVPNConfig() {
-		// Tiene configurado pero el archivo no existe
-		fileName := filepath.Base(a.config.VPNConfigPath)
-		a.configStatus.SetText(fmt.Sprintf("❌ Archivo no encontrado: %s", fileName))
-		a.connectBtn.Disable()
-		a.retryBtn.Hide()
-		a.changeFileBtn.Show()
-	} else {
-		// No hay archivo configurado
-		a.configStatus.SetText("⚠️  No hay archivo VPN configurado")
-		a.connectBtn.Disable()
-		a.retryBtn.Hide()
-		a.changeFileBtn.Show()
-	}
-}
+// --- Acciones ---------------------------------------------------------------
 
-// onConnect maneja el evento de conectar
 func (a *App) onConnect() {
-	// Verificar que exista el config
-	if !a.config.IsVPNConfigValid() {
-		ShowError(a.window, "Error", "No se encontró el archivo de configuración VPN. Por favor selecciona un archivo.")
-		a.showFilePicker()
+	if !a.cfg.IsVPNConfigValid() {
+		dialog.ShowError(errors.New("seleccioná un archivo .ovpn válido primero"), a.window)
 		return
 	}
 
-	a.addLog("Iniciando conexión VPN...")
+	a.mu.Lock()
+	if a.manager != nil {
+		a.mu.Unlock()
+		return
+	}
+	a.mu.Unlock()
 
-	// Obtener la ruta del config
-	configPath := a.config.VPNConfigPath
-
-	// Buscar el binario de OpenVPN
 	openvpnPath, err := core.FindOpenVPN()
 	if err != nil {
-		a.addLog("Error al buscar OpenVPN: " + err.Error())
-		ShowError(a.window, "Error", "No se encontró OpenVPN. ¿Está instalado?")
+		dialog.ShowError(err, a.window)
 		return
 	}
+	a.addLog("Usando openvpn: " + openvpnPath)
+	a.setStatus("Conectando...", statusWait)
 
-	a.addLog(fmt.Sprintf("Usando OpenVPN: %s", openvpnPath))
+	a.connectBtn.Disable()
+	a.disconBtn.Enable()
 
-	// Iniciar el manager directamente (sin Management Interface)
-	// El manager se encarga de lanzar OpenVPN con pipes directos
-	mgr, err := core.Start(configPath, openvpnPath)
+	mgr, err := core.Start(a.cfg.VPNConfigPath, openvpnPath)
 	if err != nil {
-		a.addLog("Error al iniciar OpenVPN: " + err.Error())
-		ShowError(a.window, "Error", err.Error())
+		a.addLog("Error al iniciar: " + err.Error())
+		dialog.ShowError(err, a.window)
+		a.setStatus("Error", statusErr)
+		a.connectBtn.Enable()
+		a.disconBtn.Disable()
 		return
 	}
 
+	a.mu.Lock()
 	a.manager = mgr
 	a.sendFns = mgr.SendFunctions()
+	a.mu.Unlock()
 
-	// Actualizar UI
-	a.setState(StateConnecting)
-	a.connectBtn.Disable()
-	a.disconnectBtn.Enable()
-
-	a.addLog("Esperando prompts de autenticación...")
-
-	// Iniciar procesamiento de eventos
-	go a.handleEvents()
+	go a.pumpEvents(mgr)
 }
 
-// onDisconnect maneja el evento de desconectar
 func (a *App) onDisconnect() {
-	a.addLog("Desconectando...")
-	// Set state immediately to prevent race conditions in callbacks
-	a.setState(StateDisconnected)
-
-	// El manager se encarga de matar el proceso OpenVPN cuando se llama Stop()
-	if a.manager != nil {
-		a.manager.Stop()
-		a.addLog("Proceso OpenVPN detenido")
-		a.manager = nil
-	}
-
-	a.connectBtn.Enable()
-	a.disconnectBtn.Disable()
+	a.setStatus("Desconectando...", statusWait)
+	a.disconBtn.Disable()
+	a.connectBtn.Disable()
+	go a.disconnect()
 }
 
-// handleEvents procesa los eventos del manager
-func (a *App) handleEvents() {
-	for event := range a.manager.Events() {
-		switch event.Type {
-		case core.EventLogLine:
-			a.addLog(event.Message)
+func (a *App) disconnect() {
+	a.mu.Lock()
+	mgr := a.manager
+	a.manager = nil
+	a.sendFns = core.SendFns{}
+	a.mu.Unlock()
+	if mgr != nil {
+		mgr.Stop()
+	}
+	fyne.Do(func() {
+		a.setStatus("Desconectado", statusIdle)
+		a.connectBtn.Enable()
+		a.disconBtn.Disable()
+		a.chart.Reset()
+		a.rxRate.SetText("0 B/s")
+		a.txRate.SetText("0 B/s")
+	})
+}
 
-		case core.EventAskUser:
-			a.setState(StateAuthenticating)
-			ShowUsernamePromptWithRemember(a.window, a.savedUsername, a.rememberCreds, func(result PromptResult) {
-				if a.getState() != StateAuthenticating {
-					return // Abort if state changed (e.g., disconnected)
-				}
-				a.savedUsername = result.Value
-				a.rememberCreds = result.Remember
-
-				// Enviar username a OpenVPN
-				if err := a.sendFns.Username(result.Value); err != nil {
-					a.addLog("Error al enviar usuario: " + err.Error())
-				}
-			})
-
-		case core.EventAskPass:
-			a.setState(StateAuthenticating)
-			ShowPasswordPromptWithDefault(a.window, a.savedPassword, func(password string) {
-				if a.getState() != StateAuthenticating {
-					return // Abort if state changed
-				}
-				a.savedPassword = password
-
-				if a.rememberCreds {
-					method, warning, err := core.SaveCredentials(a.savedUsername, a.savedPassword)
-					if err != nil {
-						a.addLog("Advertencia: No se pudieron guardar las credenciales: " + err.Error())
-					} else {
-						a.credStore = method
-						a.logCredentialSave(method)
-						if warning != "" {
-							a.addLog("Aviso: " + warning)
-						}
-					}
-				} else {
-					if err := core.DeleteCredentials(); err != nil {
-						a.addLog("Advertencia: No se pudieron eliminar credenciales guardadas: " + err.Error())
-					}
-					a.savedUsername = ""
-					a.savedPassword = ""
-					a.credStore = core.CredentialStoreMethodNone
-				}
-
-				if err := a.sendFns.Password(password); err != nil {
-					a.addLog("Error al enviar contraseña: " + err.Error())
-				}
-			})
-
-		case core.EventAskOTP:
-			a.setState(StateAuthenticating)
-			ShowOTPPrompt(a.window, func(otp string) {
-				if a.getState() != StateAuthenticating {
-					return // Abort if state changed
-				}
-				if err := a.sendFns.OTP(otp); err != nil {
-					a.addLog("Error al enviar OTP: " + err.Error())
-				}
-			})
-
-		case core.EventConnected:
-			a.setState(StateConnected)
-			a.addLog(event.Message)
-			ShowInfo(a.window, "Conectado", "Conexión VPN establecida exitosamente")
-
-		case core.EventAuthFailed:
-			a.setState(StateAuthenticating)
-			a.addLog("Error: " + event.Message)
-			ShowError(a.window, "Error de autenticación", event.Message)
-
-			if event.Stage == "password" {
-				ShowPasswordPromptWithDefault(a.window, a.savedPassword, func(password string) {
-					if a.getState() != StateAuthenticating {
-						return // Abort if state changed
-					}
-					a.savedPassword = password
-					if a.rememberCreds {
-						// Re-save credentials on failure if remember is checked
-						if _, _, err := core.SaveCredentials(a.savedUsername, a.savedPassword); err != nil {
-							a.addLog("Advertencia: No se pudieron actualizar las credenciales: " + err.Error())
-						}
-					}
-					if err := a.sendFns.Password(password); err != nil {
-						a.addLog("Error al enviar contraseña: " + err.Error())
-					}
-				})
-			} else if event.Stage == "otp" {
-				ShowOTPPrompt(a.window, func(otp string) {
-					if a.getState() != StateAuthenticating {
-						return // Abort if state changed
-					}
-					if err := a.sendFns.OTP(otp); err != nil {
-						a.addLog("Error al enviar OTP: " + err.Error())
-					}
-				})
-			}
-
-		case core.EventFatal:
-			a.setState(StateError)
-			a.addLog("Error fatal: " + event.Message)
-			ShowError(a.window, "Error Fatal", event.Message)
-			a.onDisconnect()
-
-		case core.EventDisconnected:
-			a.addLog("Conexión cerrada")
-			a.onDisconnect()
+func (a *App) onBrowse() {
+	d := dialog.NewFileOpen(func(reader fyne.URIReadCloser, err error) {
+		if err != nil || reader == nil {
+			return
 		}
-	}
+		defer reader.Close()
+		path := reader.URI().Path()
+		if filepath.Ext(strings.ToLower(path)) != ".ovpn" {
+			dialog.ShowError(errors.New("el archivo debe ser .ovpn"), a.window)
+			return
+		}
+		a.ovpnEntry.SetText(path)
+		a.saveConfig(path)
+	}, a.window)
+	d.SetFilter(storage.NewExtensionFileFilter([]string{".ovpn"}))
+	d.Resize(fyne.NewSize(700, 500))
+	d.Show()
 }
 
-// getState de forma segura para hilos
-func (a *App) getState() AppState {
-	a.stateMutex.RLock()
-	defer a.stateMutex.RUnlock()
-	return a.state
+func (a *App) onSaveConfig() {
+	a.saveConfig(strings.TrimSpace(a.ovpnEntry.Text))
 }
 
-// setState actualiza el estado de la aplicación de forma segura para hilos
-func (a *App) setState(state AppState) {
-	a.stateMutex.Lock()
-	a.state = state
-	a.stateMutex.Unlock()
-
-	switch state {
-	case StateDisconnected:
-		a.statusLabel.SetText("Estado: Desconectado")
-	case StateConnecting:
-		a.statusLabel.SetText("Estado: Conectando...")
-	case StateAuthenticating:
-		a.statusLabel.SetText("Estado: Autenticando...")
-	case StateConnected:
-		a.statusLabel.SetText("Estado: Conectado ✅")
-	case StateError:
-		a.statusLabel.SetText("Estado: Error ❌")
-	}
-	a.statusLabel.Refresh()
-
-	// Actualizar tray icon también
-	a.updateTrayIcon()
-}
-
-// updateTrayIcon actualiza el icono y estado del system tray
-func (a *App) updateTrayIcon() {
-	if a.trayIcon == nil {
+func (a *App) saveConfig(path string) {
+	if path == "" {
 		return
 	}
-
-	state := a.getState()
-	switch state {
-	case StateDisconnected:
-		a.trayIcon.SetIcon(tray.IconDisconnected)
-		a.trayIcon.UpdateState("Desconectado", false)
-
-	case StateConnecting:
-		a.trayIcon.SetIcon(tray.IconConnecting)
-		a.trayIcon.UpdateState("Conectando...", false)
-
-	case StateAuthenticating:
-		a.trayIcon.SetIcon(tray.IconConnecting)
-		a.trayIcon.UpdateState("Autenticando...", false)
-
-	case StateConnected:
-		a.trayIcon.SetIcon(tray.IconConnected)
-		a.trayIcon.UpdateState("Conectado", true)
-
-	case StateError:
-		a.trayIcon.SetIcon(tray.IconError)
-		a.trayIcon.UpdateState("Error", false)
+	a.cfg.VPNConfigPath = path
+	if err := a.cfg.Save(); err != nil {
+		a.addLog("Error guardando config: " + err.Error())
+		return
 	}
+	a.addLog("✓ Configuración guardada: " + path)
 }
 
-// addLog agrega una línea al buffer de logs y actualiza la UI
-func (a *App) addLog(line string) {
-	a.logBuffer.Add(line)
-	a.logView.SetText(a.logBuffer.GetText())
+// --- Pump de eventos del Manager --------------------------------------------
 
-	// Auto-scroll al final
-	if a.logView.Visible() {
-		a.logView.CursorRow = len(a.logBuffer.GetAll())
+func (a *App) pumpEvents(mgr *core.Manager) {
+	for ev := range mgr.Events() {
+		a.routeEvent(ev)
 	}
-	a.logView.Refresh()
+	// Canal cerrado: el Manager terminó.
+	fyne.Do(func() {
+		a.setStatus("Desconectado", statusIdle)
+		a.connectBtn.Enable()
+		a.disconBtn.Disable()
+	})
 }
 
-func (a *App) logCredentialSave(method core.CredentialStoreMethod) {
-	switch method {
-	case core.CredentialStoreMethodKeyring:
-		a.addLog("✓ Credenciales guardadas en el keyring del sistema")
-	case core.CredentialStoreMethodFile:
-		a.addLog("✓ Credenciales guardadas en archivo seguro: " + fallbackCredentialsPathLabel())
-	}
-}
+func (a *App) routeEvent(ev core.Event) {
+	switch ev.Type {
+	case core.EventLogLine:
+		a.addLog(ev.Message)
 
-func (a *App) logCredentialLoad(method core.CredentialStoreMethod) {
-	switch method {
-	case core.CredentialStoreMethodKeyring:
-		a.addLog("✓ Credenciales cargadas desde el keyring del sistema")
-	case core.CredentialStoreMethodFile:
-		a.addLog("✓ Credenciales cargadas desde archivo local: " + fallbackCredentialsPathLabel())
-	}
-}
-
-func fallbackCredentialsPathLabel() string {
-	if path := core.GetCredentialsFallbackPath(); path != "" {
-		return path
-	}
-	return "~/.config/NavTunnel/credentials.json"
-}
-
-// showWelcomeDialog muestra el diálogo de bienvenida para primera ejecución
-func (a *App) showWelcomeDialog() {
-	dialog.ShowCustom(
-		"👋 Bienvenido a NavTunnel",
-		"Continuar",
-		widget.NewLabel("Para comenzar, necesitas seleccionar tu archivo de configuración VPN (.ovpn)"),
-		a.window,
-	)
-
-	// Dar tiempo para que el usuario lea el mensaje
-	go func() {
-		// Esperar un poco y luego mostrar el file picker
-		a.showFilePicker()
-	}()
-}
-
-// showFilePicker muestra el selector de archivos para elegir un .ovpn
-func (a *App) showFilePicker() {
-	// Crear file dialog
-	fileDialog := dialog.NewFileOpen(func(reader fyne.URIReadCloser, err error) {
-		if err != nil {
-			a.addLog("Error al seleccionar archivo: " + err.Error())
-			return
+	case core.EventState:
+		switch ev.State {
+		case "CONNECTED":
+			a.setStatus("Conectado", statusOK)
+		case "EXITING":
+			a.setStatus("Saliendo", statusWait)
+		default:
+			a.setStatus(ev.State, statusWait)
 		}
-		if reader == nil {
-			// Usuario canceló
-			a.addLog("Selección de archivo cancelada")
-			return
+		if ev.LocalTunIP != "" {
+			fyne.Do(func() { a.tunLabel.SetText(ev.LocalTunIP) })
+		}
+		if ev.RemoteIP != "" {
+			fyne.Do(func() { a.serverLabel.SetText(ev.RemoteIP) })
 		}
 
-		// Obtener la ruta del archivo
-		filePath := reader.URI().Path()
-		reader.Close()
+	case core.EventBytecount:
+		rate := a.currentRates()
+		fyne.Do(func() {
+			a.rxTotal.SetText(humanBytes(ev.BytesIn))
+			a.txTotal.SetText(humanBytes(ev.BytesOut))
+			a.rxRate.SetText(humanBytes(rate.in) + "/s")
+			a.txRate.SetText(humanBytes(rate.out) + "/s")
+		})
+		a.chart.Push(float64(rate.in), float64(rate.out))
 
-		// Verificar que sea un archivo .ovpn
-		if filepath.Ext(filePath) != ".ovpn" {
-			ShowError(a.window, "Error", "Por favor selecciona un archivo .ovpn válido")
+	case core.EventAskUser:
+		a.credMu.Lock()
+		saved := a.savedUser
+		a.credMu.Unlock()
+		if saved != "" && a.autoSendUsername(saved) {
 			return
 		}
+		a.openCredentialPrompt("USUARIO", ev.Message, false, true, saved != "", func(r credentialResult) {
+			a.credMu.Lock()
+			a.savedUser = r.value
+			a.rememberCreds = r.remember
+			a.credMu.Unlock()
+			a.mu.Lock()
+			fn := a.sendFns.Username
+			a.mu.Unlock()
+			if fn != nil {
+				if err := fn(r.value); err != nil {
+					a.addLog("Error enviando usuario: " + err.Error())
+				}
+			}
+		})
 
-		// Guardar en configuración
-		a.config.VPNConfigPath = filePath
-		if err := a.config.Save(); err != nil {
-			a.addLog("Error al guardar configuración: " + err.Error())
-			ShowError(a.window, "Error", "No se pudo guardar la configuración")
+	case core.EventAskPass:
+		a.credMu.Lock()
+		saved := a.savedPass
+		a.credMu.Unlock()
+		if saved != "" && a.autoSendPassword(saved) {
 			return
 		}
+		a.openCredentialPrompt("CONTRASEÑA", ev.Message, true, true, a.rememberCreds, func(r credentialResult) {
+			a.credMu.Lock()
+			a.savedPass = r.value
+			a.rememberCreds = r.remember
+			user := a.savedUser
+			a.credMu.Unlock()
+			a.persistCredentials(user, r.value, r.remember)
+			a.mu.Lock()
+			fn := a.sendFns.Password
+			a.mu.Unlock()
+			if fn != nil {
+				if err := fn(r.value); err != nil {
+					a.addLog("Error enviando contraseña: " + err.Error())
+				}
+			}
+		})
 
-		// Actualizar UI
-		a.updateConfigStatus()
-		fileName := filepath.Base(filePath)
-		a.addLog(fmt.Sprintf("✓ Archivo VPN seleccionado: %s", fileName))
-		ShowInfo(a.window, "Archivo configurado", fmt.Sprintf("Se ha configurado el archivo:\n%s\n\nYa puedes conectarte.", fileName))
-	}, a.window)
+	case core.EventAskOTP:
+		a.openCredentialPrompt("CÓDIGO OTP", ev.Message, false, false, false, func(r credentialResult) {
+			a.mu.Lock()
+			fn := a.sendFns.OTP
+			a.mu.Unlock()
+			if fn != nil {
+				if err := fn(r.value); err != nil {
+					a.addLog("Error enviando OTP: " + err.Error())
+				}
+			}
+		})
 
-	// Configurar filtro para solo mostrar archivos .ovpn
-	fileDialog.SetFilter(storage.NewExtensionFileFilter([]string{".ovpn"}))
+	case core.EventConnected:
+		a.setStatus("Conectado", statusOK)
+		a.addLog(ev.Message)
 
-	// Intentar abrir en el directorio home del usuario
-	homeDir, err := storage.ListerForURI(storage.NewFileURI(getUserHomeDir()))
-	if err == nil {
-		fileDialog.SetLocation(homeDir)
+	case core.EventAuthFailed:
+		a.invalidateSavedFor(ev.Stage)
+		a.addLog("✗ " + ev.Message)
+
+	case core.EventFatal:
+		a.addLog("FATAL: " + ev.Message)
+		a.setStatus("Error", statusErr)
+		dialog.ShowError(fmt.Errorf("%s", ev.Message), a.window)
+
+	case core.EventDisconnected:
+		a.addLog(ev.Message)
+		fyne.Do(func() {
+			a.setStatus("Desconectado", statusIdle)
+			a.connectBtn.Enable()
+			a.disconBtn.Disable()
+		})
 	}
-
-	fileDialog.Show()
 }
 
-// getUserHomeDir retorna el directorio home del usuario
-func getUserHomeDir() string {
-	home, err := os.UserHomeDir()
+// openCredentialPrompt garantiza que solo haya un modal abierto.
+func (a *App) openCredentialPrompt(title, msg string, masked, showRemember, initialRemember bool, onConfirm func(credentialResult)) {
+	a.promptMu.Lock()
+	if a.promptActive {
+		a.promptMu.Unlock()
+		return
+	}
+	a.promptActive = true
+	a.promptMu.Unlock()
+
+	fyne.Do(func() {
+		promptCredential(a.window, title, msg, masked, showRemember, initialRemember, func(r credentialResult) {
+			a.promptMu.Lock()
+			a.promptActive = false
+			a.promptMu.Unlock()
+			onConfirm(r)
+		})
+	})
+}
+
+// --- Credenciales guardadas -------------------------------------------------
+
+type rates struct{ in, out uint64 }
+
+func (a *App) currentRates() rates {
+	a.mu.Lock()
+	mgr := a.manager
+	a.mu.Unlock()
+	if mgr == nil {
+		return rates{}
+	}
+	m := mgr.Metrics()
+	return rates{in: m.BytesInRate, out: m.BytesOutRate}
+}
+
+func (a *App) loadStoredCredentials() {
+	user, pass, method, warning, err := core.LoadCredentials()
+	if warning != "" {
+		a.addLog("Aviso credenciales: " + warning)
+	}
 	if err != nil {
-		return "/"
+		if !errors.Is(err, core.ErrCredentialsNotFound) {
+			a.addLog("No se pudieron cargar credenciales: " + err.Error())
+		}
+		return
 	}
-	return home
+	a.credMu.Lock()
+	a.savedUser = user
+	a.savedPass = pass
+	a.credStore = method
+	a.rememberCreds = true
+	a.credMu.Unlock()
 }
 
-// Run inicia la aplicación con soporte de system tray
-func (a *App) Run() {
-	// Iniciar systray en un goroutine
-	// Systray.Run es bloqueante, por lo que lo ejecutamos en paralelo
-	go func() {
-		a.trayIcon.Run(
-			func() {
-				// onReady - tray está listo e inicializado
-				a.addLog("System tray inicializado")
-				// Ahora sí actualizar el icono del tray
-				a.updateTrayIcon()
-			},
-			func() {
-				// onExit - tray cerrado
-				a.fyneApp.Quit()
-			},
-		)
-	}()
-
-	// Iniciar la ventana de Fyne (bloqueante)
-	a.window.ShowAndRun()
-
-	// Cuando la ventana de Fyne se cierra, cerrar también el tray
-	if a.trayIcon != nil {
-		a.trayIcon.Quit()
+func (a *App) persistCredentials(user, pass string, remember bool) {
+	if remember {
+		if user == "" || pass == "" {
+			return
+		}
+		method, warning, err := core.SaveCredentials(user, pass)
+		if err != nil {
+			a.addLog("No se pudieron guardar credenciales: " + err.Error())
+			return
+		}
+		if warning != "" {
+			a.addLog("Aviso credenciales: " + warning)
+		}
+		a.credMu.Lock()
+		a.credStore = method
+		a.credMu.Unlock()
+		return
 	}
+	if err := core.DeleteCredentials(); err != nil {
+		a.addLog("No se pudieron borrar credenciales: " + err.Error())
+	}
+	a.credMu.Lock()
+	a.savedUser = ""
+	a.savedPass = ""
+	a.credStore = core.CredentialStoreMethodNone
+	a.credMu.Unlock()
+}
+
+func (a *App) autoSendUsername(v string) bool {
+	a.mu.Lock()
+	fn := a.sendFns.Username
+	a.mu.Unlock()
+	if fn == nil {
+		return false
+	}
+	if err := fn(v); err != nil {
+		a.addLog("No se pudo enviar usuario guardado: " + err.Error())
+		return false
+	}
+	a.addLog("✓ Usuario enviado (recordado)")
+	return true
+}
+
+func (a *App) autoSendPassword(v string) bool {
+	a.mu.Lock()
+	fn := a.sendFns.Password
+	a.mu.Unlock()
+	if fn == nil {
+		return false
+	}
+	if err := fn(v); err != nil {
+		a.addLog("No se pudo enviar contraseña guardada: " + err.Error())
+		return false
+	}
+	a.addLog("✓ Contraseña enviada (recordada)")
+	return true
+}
+
+func (a *App) invalidateSavedFor(stage string) {
+	a.credMu.Lock()
+	switch stage {
+	case "username":
+		a.savedUser = ""
+		a.savedPass = ""
+	case "password":
+		a.savedPass = ""
+	default:
+		a.credMu.Unlock()
+		return
+	}
+	a.credMu.Unlock()
+	go func() { _ = core.DeleteCredentials() }()
+}
+
+// --- Logs -------------------------------------------------------------------
+
+func (a *App) addLog(line string) {
+	a.logBuf.Add(line)
+	if a.logsBox == nil {
+		return
+	}
+	text := a.logBuf.GetText()
+	fyne.Do(func() {
+		a.logsBox.SetText(text)
+		a.logsBox.CursorRow = len(a.logBuf.GetAll())
+	})
+}
+
+// --- Helpers ----------------------------------------------------------------
+
+func humanBytes(n uint64) string {
+	if n < 1024 {
+		return fmt.Sprintf("%d B", n)
+	}
+	units := []string{"KB", "MB", "GB", "TB"}
+	v := float64(n)
+	i := -1
+	for v >= 1024 && i < len(units)-1 {
+		v /= 1024
+		i++
+	}
+	if v >= 10 {
+		return fmt.Sprintf("%.1f %s", v, units[i])
+	}
+	return fmt.Sprintf("%.2f %s", v, units[i])
 }

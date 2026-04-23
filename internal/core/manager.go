@@ -2,16 +2,28 @@ package core
 
 import (
 	"bufio"
+	"crypto/rand"
+	"encoding/hex"
+	"errors"
 	"fmt"
+	"io"
+	"net"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
+	"time"
 
-	"github.com/creack/pty"
+	"github.com/lavp2393/navtunnel/internal/platform"
 )
 
-// EventType representa el tipo de evento
+// authReadTimeout es el deadline por operación de lectura durante el
+// handshake inicial con el management. Se aplica a cada Read por separado,
+// no como deadline total, para no acumular tiempo entre líneas.
+const authReadTimeout = 10 * time.Second
+
+// EventType representa el tipo de evento emitido por el Manager.
 type EventType int
 
 const (
@@ -23,354 +35,675 @@ const (
 	EventFatal
 	EventLogLine
 	EventDisconnected
+	EventState     // Nuevo: cambios de estado de OpenVPN con IPs.
+	EventBytecount // Nuevo: contadores de tráfico acumulados.
 )
 
-// Event representa un evento del proceso OpenVPN
+// Event describe un suceso en la sesión OpenVPN.
+// Los campos opcionales se populan según Type.
 type Event struct {
 	Type    EventType
 	Message string
-	Stage   string // Para AuthFailed: "password" o "otp"
+	Stage   string // Para EventAuthFailed: "username" | "password" | "otp".
+
+	// EventState:
+	State      string
+	LocalTunIP string
+	RemoteIP   string
+
+	// EventBytecount:
+	BytesIn  uint64
+	BytesOut uint64
 }
 
-// SendFns agrupa las funciones para enviar credenciales
+// SendFns agrupa los callbacks que la UI invoca para entregar credenciales.
 type SendFns struct {
 	Username func(string) error
 	Password func(string) error
 	OTP      func(string) error
 }
 
-// Manager gestiona la comunicación con el proceso OpenVPN
+type credState int
+
+const (
+	csIdle credState = iota
+	csWaitUser
+	csWaitPass
+	csWaitOTPStatic  // Pendiente un OTP para combinar con pass (SCRV1).
+	csWaitOTPDynamic // Pendiente un OTP ante challenge dinámico (CRV1) tras fallo.
+	csSent
+)
+
+// Manager controla el ciclo de vida de OpenVPN y habla con su management
+// interface por socket TCP local autenticado por cookie.
 type Manager struct {
-	cmd          *exec.Cmd
-	ptmx         *os.File // Pseudo-terminal master
-	events       chan Event
-	stopCh       chan struct{}
-	wg           sync.WaitGroup
-	currentStage string // "username", "password", "otp"
-	mu           sync.Mutex
+	cmd    *exec.Cmd
+	conn   net.Conn
+	reader *bufio.Reader
+
+	events     chan Event
+	stopCh     chan struct{}
+	stopOnce   sync.Once
+	wg         sync.WaitGroup
+	procExited chan struct{} // se cierra cuando cmd.Wait() retorna
+
+	writeMu sync.Mutex // Serializa escrituras al socket.
+
+	credMu              sync.Mutex
+	credStateVal        credState
+	pendingUser         string
+	pendingPass         string
+	hasStaticChallenge  bool
+	staticChallengeText string
+	lastCRV1State       string
+
+	pwFilePath string // Archivo temporal con la cookie, se borra en Stop().
+	metrics    *metricsStore
 }
 
-// Start inicia el manager y el proceso OpenVPN
-// IMPORTANTE: ovpnPath es la ruta a tu archivo .ovpn
-func Start(ovpnPath string, openvpnBinary string) (*Manager, error) {
+// Start lanza OpenVPN con management activo y se conecta. El ovpnPath es el
+// archivo .ovpn del usuario; openvpnBinary es opcional (se busca en PATH si
+// está vacío).
+func Start(ovpnPath, openvpnBinary string) (*Manager, error) {
 	if openvpnBinary == "" {
-		openvpnBinary = "openvpn"
+		var err error
+		openvpnBinary, err = FindOpenVPN()
+		if err != nil {
+			return nil, err
+		}
 	}
 
-	// 1. Preparar el comando OpenVPN con elevación de privilegios
-	// En Linux, OpenVPN necesita ejecutarse como root para crear el túnel
-	// Usamos sudo porque pkexec bloquea stdin/stdout para interacción
+	port, err := findFreePort()
+	if err != nil {
+		return nil, fmt.Errorf("no se encontró puerto libre para management: %w", err)
+	}
+
+	cookie, err := randomHex(16)
+	if err != nil {
+		return nil, err
+	}
+	pwFile, err := writePasswordFile(cookie)
+	if err != nil {
+		return nil, err
+	}
+
 	args := []string{
 		"--config", ovpnPath,
-		"--auth-nocache",
+		"--management", "127.0.0.1", strconv.Itoa(port), pwFile,
+		"--management-query-passwords",
+		"--management-hold",
 		"--auth-retry", "interact",
-		"--verb", "3", // Verbosidad moderada
+		"--auth-nocache",
+		"--verb", "3",
 	}
 
-	// Elevar con sudo
-	// Asume que el usuario tiene NOPASSWD configurado para openvpn
-	sudoArgs := append([]string{openvpnBinary}, args...)
-	cmd := exec.Command("sudo", sudoArgs...)
-
-	// 2. Crear un pseudo-terminal (PTY)
-	// Esto simula un terminal interactivo real, evitando que OpenVPN
-	// use systemd-ask-password
-	ptmx, err := pty.Start(cmd)
+	plat := platform.New()
+	program, fullArgs, err := plat.ElevateCommand(openvpnBinary, args)
 	if err != nil {
-		return nil, fmt.Errorf("error al iniciar OpenVPN con PTY: %w", err)
+		_ = os.Remove(pwFile)
+		return nil, fmt.Errorf("preparando elevación: %w", err)
 	}
 
-	// 3. Crear el Manager
+	cmd := exec.Command(program, fullArgs...)
+	// Capturamos stdout/stderr además del management socket: antes de que el
+	// management esté listo (arranque temprano, errores de config, mensajes
+	// del elevador pkexec/osascript), el socket aún no emite, pero stderr sí.
+	// Los volcamos a m.events como EventLogLine.
+	stdoutPipe, err := cmd.StdoutPipe()
+	if err != nil {
+		_ = os.Remove(pwFile)
+		return nil, fmt.Errorf("creando stdout pipe: %w", err)
+	}
+	stderrPipe, err := cmd.StderrPipe()
+	if err != nil {
+		_ = stdoutPipe.Close()
+		_ = os.Remove(pwFile)
+		return nil, fmt.Errorf("creando stderr pipe: %w", err)
+	}
+	if err := cmd.Start(); err != nil {
+		_ = os.Remove(pwFile)
+		return nil, fmt.Errorf("iniciando openvpn: %w", err)
+	}
+
+	conn, err := dialManagement("127.0.0.1:"+strconv.Itoa(port), 8*time.Second)
+	if err != nil {
+		_ = cmd.Process.Kill()
+		_ = os.Remove(pwFile)
+		return nil, fmt.Errorf("conectando al management socket: %w", err)
+	}
+
 	m := &Manager{
-		cmd:    cmd,
-		ptmx:   ptmx,
-		events: make(chan Event, 100),
-		stopCh: make(chan struct{}),
+		cmd:        cmd,
+		conn:       conn,
+		reader:     bufio.NewReader(conn),
+		events:     make(chan Event, 256),
+		stopCh:     make(chan struct{}),
+		procExited: make(chan struct{}),
+		pwFilePath: pwFile,
+		metrics:    newMetricsStore(),
 	}
 
-	// 4. Iniciar el lector del PTY en una goroutine
-	m.wg.Add(1)
-	go m.readPTY()
+	// Drenar stdout/stderr desde ya para que cualquier mensaje temprano del
+	// proceso (p.ej. "Options error: ..." antes de abrir el management)
+	// aparezca en la UI sin bloquear al proceso por pipes llenos.
+	m.wg.Add(2)
+	go m.drainPipe(stdoutPipe, "[openvpn] ")
+	go m.drainPipe(stderrPipe, "[openvpn] ")
 
-	// Goroutine para manejar el fin del proceso
-	go func() {
-		m.cmd.Wait()
-		// Si el proceso termina, avisamos
-		select {
-		case m.events <- Event{Type: EventDisconnected, Message: "Proceso OpenVPN terminado"}:
-		case <-m.stopCh:
+	if err := m.authenticateSocket(cookie); err != nil {
+		m.cleanupStart()
+		return nil, err
+	}
+
+	// Habilitar eventos asíncronos y liberar el hold.
+	for _, c := range []string{"state on", "bytecount 1", "log on all", "hold release"} {
+		if err := m.writeCommand(c); err != nil {
+			m.cleanupStart()
+			return nil, fmt.Errorf("enviando %q al management: %w", c, err)
 		}
-		m.Stop() // Asegurarse de cerrar todo
-	}()
+	}
+
+	m.wg.Add(2)
+	go m.readLoop()
+	go m.waitProcess()
 
 	return m, nil
 }
 
-// Events retorna el canal de eventos
-func (m *Manager) Events() <-chan Event {
-	return m.events
-}
-
-// SendFunctions retorna las funciones para enviar credenciales
-func (m *Manager) SendFunctions() SendFns {
-	return SendFns{
-		Username: func(username string) error {
-			m.mu.Lock()
-			m.currentStage = "password" // La siguiente etapa es password
-			m.mu.Unlock()
-			return m.sendCommand(username)
-		},
-		Password: func(password string) error {
-			m.mu.Lock()
-			m.currentStage = "otp" // La siguiente etapa es OTP
-			m.mu.Unlock()
-			return m.sendCommand(password)
-		},
-		OTP: func(otp string) error {
-			m.mu.Lock()
-			m.currentStage = "connected" // Ya no esperamos más credenciales
-			m.mu.Unlock()
-			return m.sendCommand(otp)
-		},
+// drainPipe lee línea por línea del stdout/stderr del proceso openvpn y
+// reemite cada línea como EventLogLine con un prefijo discriminante.
+func (m *Manager) drainPipe(r io.ReadCloser, prefix string) {
+	defer m.wg.Done()
+	defer r.Close()
+	sc := bufio.NewScanner(r)
+	sc.Buffer(make([]byte, 0, 4096), 1024*1024)
+	for sc.Scan() {
+		m.emit(Event{Type: EventLogLine, Message: prefix + sc.Text()})
 	}
 }
 
-// Stop detiene el manager y mata el proceso OpenVPN
-func (m *Manager) Stop() {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+// Events expone el canal de eventos del manager.
+func (m *Manager) Events() <-chan Event { return m.events }
 
-	select {
-	case <-m.stopCh:
-		// Ya está cerrado
-		return
-	default:
+// Metrics devuelve una copia del estado actual de métricas.
+func (m *Manager) Metrics() Metrics { return m.metrics.Snapshot() }
+
+// SendFunctions devuelve los callbacks para entregar credenciales.
+// La API es estable: la UI puede llamarlos en el orden Username → Password → OTP.
+func (m *Manager) SendFunctions() SendFns {
+	return SendFns{
+		Username: m.sendUsername,
+		Password: m.sendPassword,
+		OTP:      m.sendOTP,
+	}
+}
+
+// Stop termina el proceso OpenVPN y cierra el manager. Es idempotente.
+// Intenta cierre limpio vía "signal SIGTERM" por el management socket — esto
+// es lo único que funciona en macOS, donde matar el proceso padre (osascript)
+// no propaga la señal al openvpn elevado.
+func (m *Manager) Stop() {
+	m.stopOnce.Do(func() {
 		close(m.stopCh)
 
-		// Cerrar el PTY primero
-		if m.ptmx != nil {
-			m.ptmx.Close()
+		// Pedir shutdown limpio a openvpn. Si el socket ya está cerrado, sigue.
+		if m.conn != nil {
+			_ = m.writeCommandIgnoreStop("signal SIGTERM")
 		}
 
-		if m.cmd != nil && m.cmd.Process != nil {
-			// Intentar terminarlo limpiamente
-			m.cmd.Process.Kill()
+		// Esperar a que el proceso salga solo; si no lo hace en 1.5 s, forzar.
+		select {
+		case <-m.procExited:
+		case <-time.After(1500 * time.Millisecond):
+			if m.cmd != nil && m.cmd.Process != nil {
+				_ = m.cmd.Process.Kill()
+			}
+		}
+
+		if m.conn != nil {
+			_ = m.conn.Close()
+		}
+		if m.pwFilePath != "" {
+			_ = os.Remove(m.pwFilePath)
 		}
 		m.wg.Wait()
 		close(m.events)
-	}
+	})
 }
 
-// sendCommand envía un comando (credencial) al PTY
-func (m *Manager) sendCommand(cmd string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	if m.ptmx == nil {
-		return fmt.Errorf("PTY no está disponible")
+// writeCommandIgnoreStop escribe sin revisar stopCh. Solo lo usamos durante
+// Stop() para enviar "signal SIGTERM" justo después de cerrar stopCh.
+func (m *Manager) writeCommandIgnoreStop(cmd string) error {
+	m.writeMu.Lock()
+	defer m.writeMu.Unlock()
+	if m.conn == nil {
+		return fmt.Errorf("socket no disponible")
 	}
-	// Escribimos la credencial seguida de un salto de línea
-	_, err := m.ptmx.Write([]byte(cmd + "\n"))
+	_, err := m.conn.Write([]byte(cmd + "\n"))
 	return err
 }
 
-// readPTY lee continuamente del pseudo-terminal
-// IMPORTANTE: No usamos Scanner porque los prompts de OpenVPN no tienen newline
-func (m *Manager) readPTY() {
+// --- Autenticación del socket management ------------------------------------
+
+// authenticateSocket completa el handshake con el management:
+//  1. Espera ver "ENTER PASSWORD:" — openvpn lo emite sin newline, así que
+//     leemos caracter a caracter y cortamos al detectarlo.
+//  2. Envía el cookie + "\n".
+//  3. Espera una línea que empiece con "SUCCESS:" (o "ERROR:" si el cookie
+//     no coincide, cosa que no debería pasar porque la generamos nosotros).
+//
+// El deadline se renueva antes de cada operación de lectura para no
+// acumular el tiempo entre pasos del handshake.
+func (m *Manager) authenticateSocket(cookie string) error {
+	defer func() { _ = m.conn.SetReadDeadline(time.Time{}) }()
+
+	if err := m.readUntilPasswordPrompt(); err != nil {
+		return fmt.Errorf("management no envió prompt de auth: %w", err)
+	}
+	if _, err := m.conn.Write([]byte(cookie + "\n")); err != nil {
+		return fmt.Errorf("escribiendo cookie de auth: %w", err)
+	}
+	_ = m.conn.SetReadDeadline(time.Now().Add(authReadTimeout))
+	line, err := m.reader.ReadString('\n')
+	if err != nil && line == "" {
+		return fmt.Errorf("leyendo respuesta de auth: %w", err)
+	}
+	resp := strings.TrimSpace(line)
+	if !strings.HasPrefix(resp, "SUCCESS:") {
+		return fmt.Errorf("auth al management falló: %s", resp)
+	}
+	return nil
+}
+
+// readUntilPasswordPrompt consume el socket byte a byte hasta que el buffer
+// acumulado contenga "ENTER PASSWORD:". openvpn emite ese prompt sin
+// newline, así que ReadString('\n') bloquearía. Deja en el buffer cualquier
+// dato posterior (el siguiente Read ya es bufio).
+func (m *Manager) readUntilPasswordPrompt() error {
+	const needle = "ENTER PASSWORD:"
+	var acc strings.Builder
+	for {
+		_ = m.conn.SetReadDeadline(time.Now().Add(authReadTimeout))
+		b, err := m.reader.ReadByte()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return fmt.Errorf("socket cerrado sin prompt (leído: %q)", acc.String())
+			}
+			return err
+		}
+		acc.WriteByte(b)
+		if strings.Contains(acc.String(), needle) {
+			return nil
+		}
+		// Evitar que acc crezca indefinidamente si algo raro ocurre.
+		if acc.Len() > 4096 {
+			return fmt.Errorf("no se encontró prompt tras 4KB: %q", acc.String())
+		}
+	}
+}
+
+// --- Loop principal ---------------------------------------------------------
+
+func (m *Manager) readLoop() {
 	defer m.wg.Done()
-
-	reader := bufio.NewReader(m.ptmx)
-	var buffer strings.Builder
-	buf := make([]byte, 1024)
-
 	for {
 		select {
 		case <-m.stopCh:
 			return
 		default:
-			// Leer con timeout implícito (bloqueante pero responsive)
-			n, err := reader.Read(buf)
-			if err != nil {
-				if err.Error() != "EOF" {
-					// Error de lectura, terminar
-					return
-				}
-			}
-
-			if n > 0 {
-				chunk := string(buf[:n])
-				buffer.WriteString(chunk)
-
-				// Procesar líneas completas (con \n)
-				data := buffer.String()
-				lines := strings.Split(data, "\n")
-
-				// La última parte puede ser incompleta (sin \n)
-				buffer.Reset()
-				if !strings.HasSuffix(data, "\n") {
-					// Guardamos la línea incompleta en el buffer
-					buffer.WriteString(lines[len(lines)-1])
-					lines = lines[:len(lines)-1]
-				}
-
-				// Procesar líneas completas
-				for _, line := range lines {
-					if line != "" {
-						m.events <- Event{
-							Type:    EventLogLine,
-							Message: line,
-						}
-						m.parseLine(line)
-					}
-				}
-
-				// Procesar línea incompleta si contiene prompts conocidos
-				incomplete := buffer.String()
-				if incomplete != "" {
-					// Detectar prompts sin newline
-					if strings.Contains(incomplete, "Enter Auth Username:") ||
-						strings.Contains(incomplete, "Enter Auth Password:") ||
-						strings.Contains(incomplete, "CHALLENGE:") ||
-						strings.HasSuffix(incomplete, "Response:") {
-						m.events <- Event{
-							Type:    EventLogLine,
-							Message: incomplete,
-						}
-						m.parseLine(incomplete)
-						buffer.Reset()
-					}
-				}
-			}
+		}
+		line, err := m.reader.ReadString('\n')
+		if line != "" {
+			m.handleLine(strings.TrimRight(line, "\r\n"))
+		}
+		if err != nil {
+			return
 		}
 	}
 }
 
-// parseLine "raspa" la salida de la consola para encontrar prompts
-func (m *Manager) parseLine(line string) {
-	line = strings.TrimSpace(line)
-
-	// --- Lógica de Detección de Prompts (Basada en tu captura) ---
-
-	// 1. Pedir Usuario
-	// Cambiado de HasSuffix a Contains porque OpenVPN imprime el input en la misma línea
-	if strings.Contains(line, "Enter Auth Username:") {
-		m.mu.Lock()
-		m.currentStage = "username"
-		m.mu.Unlock()
-		m.events <- Event{
-			Type:    EventAskUser,
-			Message: "Ingresa tu usuario corporativo",
-		}
+func (m *Manager) handleLine(line string) {
+	if line == "" {
 		return
 	}
-
-	// 2. Pedir Contraseña
-	// Cambiado de HasSuffix a Contains porque OpenVPN imprime el input en la misma línea
-	if strings.Contains(line, "Enter Auth Password:") {
-		m.mu.Lock()
-		m.currentStage = "password"
-		m.mu.Unlock()
-		m.events <- Event{
-			Type:    EventAskPass,
-			Message: "Ingresa tu contraseña",
-		}
-		return
-	}
-
-	// 3. Pedir OTP - Múltiples variaciones posibles
-	// Detectar diferentes formatos de challenge de OTP
-	if strings.HasPrefix(line, "CHALLENGE:") ||
-		strings.Contains(line, "static challenge") ||
-		strings.Contains(line, "Static challenge") ||
-		(strings.Contains(line, "OTP") && strings.Contains(line, "Enter")) ||
-		strings.HasSuffix(line, "Response:") {
-		m.mu.Lock()
-		m.currentStage = "otp"
-		m.mu.Unlock()
-
-		// Extraer el mensaje del challenge si queremos
-		msg := "Ingresa tu código OTP"
-		if strings.HasPrefix(line, "CHALLENGE:") {
-			parts := strings.SplitN(line, ":", 2)
-			if len(parts) > 1 && strings.TrimSpace(parts[1]) != "" {
-				msg = strings.TrimSpace(parts[1])
-			}
-		}
-
-		m.events <- Event{
-			Type:    EventAskOTP,
-			Message: msg,
-		}
-		return
-	}
-
-	// --- Lógica de Detección de Estado ---
-
-	// 4. Fallo de Autenticación
-	if strings.Contains(line, "AUTH_FAILED") {
-		m.mu.Lock()
-		stage := m.currentStage
-		m.mu.Unlock()
-
-		m.events <- Event{
-			Type:    EventAuthFailed,
-			Message: getAuthFailedMessage(stage),
-			Stage:   stage,
-		}
-		return
-	}
-
-	// 5. Conexión Exitosa
-	// Este es el mensaje más común cuando la VPN se establece
-	if strings.Contains(line, "Initialization Sequence Completed") {
-		m.events <- Event{
-			Type:    EventConnected,
-			Message: "Conexión establecida ✅",
-		}
-		return
-	}
-
-	// 6. Error Fatal
-	if strings.HasPrefix(line, "FATAL:") {
-		m.events <- Event{
-			Type:    EventFatal,
-			Message: strings.TrimPrefix(line, "FATAL:"),
-		}
-		return
-	}
-}
-
-// getAuthFailedMessage retorna el mensaje apropiado según la etapa
-func getAuthFailedMessage(stage string) string {
-	switch stage {
-	case "password":
-		return "Contraseña incorrecta"
-	case "otp":
-		return "OTP inválido o expirado"
-	case "username":
-		return "Usuario incorrecto"
+	switch {
+	case strings.HasPrefix(line, ">STATE:"):
+		m.handleState(line)
+	case strings.HasPrefix(line, ">BYTECOUNT:"):
+		m.handleBytecount(line)
+	case strings.HasPrefix(line, ">PASSWORD:"):
+		m.handlePassword(line)
+	case strings.HasPrefix(line, ">LOG:"):
+		m.emit(Event{Type: EventLogLine, Message: stripLogPrefix(line)})
+	case strings.HasPrefix(line, ">HOLD:"):
+		// El hold inicial ya fue liberado en Start; si vuelve a aparecer (reintento),
+		// volvemos a liberar.
+		_ = m.writeCommand("hold release")
+	case strings.HasPrefix(line, ">FATAL:"):
+		m.emit(Event{Type: EventFatal, Message: strings.TrimPrefix(line, ">FATAL:")})
+	case strings.HasPrefix(line, ">INFO:"):
+		// Banner inicial, lo tratamos como log normal.
+		m.emit(Event{Type: EventLogLine, Message: strings.TrimPrefix(line, ">INFO:")})
+	case strings.HasPrefix(line, "SUCCESS:"), strings.HasPrefix(line, "ERROR:"), line == "END":
+		// Respuestas a comandos; no son eventos para la UI.
 	default:
-		// Si el fallo ocurre después de enviar el OTP
-		if stage == "connected" {
-			return "OTP inválido o expirado"
-		}
-		return "Error de autenticación"
+		// Línea no reconocida: la exponemos como log para no perderla.
+		m.emit(Event{Type: EventLogLine, Message: line})
 	}
 }
 
-// FindFreePort ya no es necesario para este método.
-// Lo comento por si lo necesitas en otro lado, pero este manager no lo usa.
-/*
-func FindFreePort() (int, error) {
-        rand.Seed(time.Now().UnixNano())
-        for i := 0; i < 10; i++ {
-                port := 49152 + rand.Intn(65535-49152)
-                ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
-                if err == nil {
-                        ln.Close()
-                        return port, nil
-                }
-        }
-        return 0, fmt.Errorf("no se pudo encontrar un puerto libre")
+func (m *Manager) handleState(line string) {
+	name, localTun, remote, ok := stateFromLine(line)
+	if !ok {
+		return
+	}
+	m.metrics.applyState(name, localTun, remote)
+	m.emit(Event{
+		Type:       EventState,
+		Message:    name,
+		State:      name,
+		LocalTunIP: localTun,
+		RemoteIP:   remote,
+	})
+	switch name {
+	case "CONNECTED":
+		m.emit(Event{Type: EventConnected, Message: "Conexión establecida"})
+	case "EXITING":
+		m.emit(Event{Type: EventDisconnected, Message: "OpenVPN saliendo"})
+	}
 }
-*/
+
+func (m *Manager) handleBytecount(line string) {
+	in, out, ok := bytecountFromLine(line)
+	if !ok {
+		return
+	}
+	m.metrics.applyBytecount(in, out)
+	m.emit(Event{Type: EventBytecount, BytesIn: in, BytesOut: out})
+}
+
+func (m *Manager) handlePassword(line string) {
+	p := parsePasswordPrompt(line)
+	if p == nil {
+		return
+	}
+	// Solo soportamos el realm Auth (credenciales corporativas).
+	if p.realm != "" && p.realm != "Auth" {
+		m.emit(Event{
+			Type:    EventFatal,
+			Message: fmt.Sprintf("realm no soportado: %q (ej. certificado con passphrase)", p.realm),
+		})
+		return
+	}
+
+	m.credMu.Lock()
+	if p.crv1 {
+		m.credStateVal = csWaitOTPDynamic
+		m.lastCRV1State = p.crv1State
+		msg := p.crv1Text
+		if msg == "" {
+			msg = "Ingresa tu código OTP"
+		}
+		m.credMu.Unlock()
+		m.emit(Event{Type: EventAskOTP, Message: msg})
+		return
+	}
+
+	if p.needsCredential {
+		m.hasStaticChallenge = p.staticChallenge != ""
+		m.staticChallengeText = p.staticChallenge
+		m.credStateVal = csWaitUser
+		m.credMu.Unlock()
+		m.emit(Event{Type: EventAskUser, Message: "Ingresa tu usuario corporativo"})
+		return
+	}
+
+	// Verification Failed sin CRV1 ni Need: auth rechazada "pura".
+	// Reportamos usando la etapa donde estábamos esperando respuesta.
+	stage := credStageFor(m.credStateVal)
+	m.credMu.Unlock()
+	m.emit(Event{Type: EventAuthFailed, Message: "Autenticación rechazada", Stage: stage})
+}
+
+// credStageFor mapea el estado interno a la etapa lógica que usa la UI
+// para mensajes de AUTH_FAILED ("username" | "password" | "otp").
+func credStageFor(s credState) string {
+	switch s {
+	case csWaitUser:
+		return "username"
+	case csWaitPass, csSent:
+		return "password"
+	case csWaitOTPStatic, csWaitOTPDynamic:
+		return "otp"
+	default:
+		return "password"
+	}
+}
+
+// --- Envío de credenciales --------------------------------------------------
+
+func (m *Manager) sendUsername(user string) error {
+	if err := validateCredInput(user); err != nil {
+		return err
+	}
+	m.credMu.Lock()
+	m.pendingUser = user
+	m.credStateVal = csWaitPass
+	m.credMu.Unlock()
+
+	m.emit(Event{Type: EventAskPass, Message: "Ingresa tu contraseña"})
+	return nil
+}
+
+func (m *Manager) sendPassword(pass string) error {
+	if err := validateCredInput(pass); err != nil {
+		return err
+	}
+	m.credMu.Lock()
+	m.pendingPass = pass
+	if m.hasStaticChallenge {
+		msg := m.staticChallengeText
+		m.credStateVal = csWaitOTPStatic
+		m.credMu.Unlock()
+		if msg == "" {
+			msg = "Ingresa tu código OTP"
+		}
+		m.emit(Event{Type: EventAskOTP, Message: msg})
+		return nil
+	}
+	user := m.pendingUser
+	m.credStateVal = csSent
+	// No limpiamos pendingPass aún; si el server responde con CRV1 dinámico
+	// el siguiente sendOTP no lo necesita, pero lo borramos en Stop() o al reiniciar flujo.
+	m.credMu.Unlock()
+
+	return m.writeAuthPair(user, pass)
+}
+
+func (m *Manager) sendOTP(otp string) error {
+	if err := validateCredInput(otp); err != nil {
+		return err
+	}
+	m.credMu.Lock()
+	state := m.credStateVal
+	user := m.pendingUser
+	pass := m.pendingPass
+	crv := m.lastCRV1State
+	m.credStateVal = csSent
+	m.credMu.Unlock()
+
+	var passField string
+	switch state {
+	case csWaitOTPStatic:
+		passField = buildStaticChallengeResponse(pass, otp)
+	case csWaitOTPDynamic:
+		passField = buildDynamicChallengeResponse(crv, otp)
+	default:
+		return fmt.Errorf("no se esperaba un OTP en el estado actual")
+	}
+	return m.writeAuthPair(user, passField)
+}
+
+func (m *Manager) writeAuthPair(user, passField string) error {
+	if err := m.writeCommand("username " + encodeCommandArg("Auth") + " " + encodeCommandArg(user)); err != nil {
+		return err
+	}
+	return m.writeCommand("password " + encodeCommandArg("Auth") + " " + encodeCommandArg(passField))
+}
+
+func validateCredInput(s string) error {
+	if strings.ContainsAny(s, "\n\r\x00") {
+		return fmt.Errorf("credencial contiene caracteres de control no permitidos")
+	}
+	return nil
+}
+
+// --- Gestión del subproceso -------------------------------------------------
+
+func (m *Manager) waitProcess() {
+	defer m.wg.Done()
+	defer close(m.procExited)
+
+	err := m.cmd.Wait()
+	msg := "Proceso OpenVPN terminado"
+	var exitErr *exec.ExitError
+	if err != nil && !errors.As(err, &exitErr) {
+		msg = fmt.Sprintf("OpenVPN terminó: %v", err)
+	}
+	m.emit(Event{Type: EventDisconnected, Message: msg})
+}
+
+// --- Utilidades del socket --------------------------------------------------
+
+func (m *Manager) writeCommand(cmd string) error {
+	select {
+	case <-m.stopCh:
+		return fmt.Errorf("manager detenido")
+	default:
+	}
+	m.writeMu.Lock()
+	defer m.writeMu.Unlock()
+	if m.conn == nil {
+		return fmt.Errorf("socket no disponible")
+	}
+	_, err := m.conn.Write([]byte(cmd + "\n"))
+	return err
+}
+
+// emit publica un evento sin bloquear.
+//
+// Importante: NO escucha stopCh. Si lo hiciera, el orden de cierre en Stop()
+// (cerrar stopCh → matar proceso → wg.Wait() → cerrar events) haría que
+// waitProcess emita EventDisconnected *después* de que stopCh esté cerrado,
+// y el select elegiría stopCh descartando el evento — la UI quedaría
+// pegada en "Desconectando...". Al confiar en el buffer (256) y en el
+// recover() para el caso raro de envío a canal cerrado, no perdemos el
+// evento final.
+func (m *Manager) emit(e Event) {
+	defer func() { _ = recover() }()
+	select {
+	case m.events <- e:
+	default:
+		// Buffer lleno: descartar. El consumidor está vivo pero atrasado,
+		// no queremos que readLoop/waitProcess bloqueen por la UI.
+	}
+}
+
+func (m *Manager) cleanupStart() {
+	if m.conn != nil {
+		_ = m.conn.Close()
+	}
+	if m.cmd != nil && m.cmd.Process != nil {
+		_ = m.cmd.Process.Kill()
+	}
+	// Esperar que las goroutines de drain (stdout/stderr) salgan tras el Kill.
+	// Normalmente toma <100 ms (el kernel cierra los FDs y Scan() retorna).
+	done := make(chan struct{})
+	go func() { m.wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+	}
+	_ = os.Remove(m.pwFilePath)
+}
+
+// --- Helpers auxiliares -----------------------------------------------------
+
+// findFreePort pide al kernel un puerto libre en loopback y lo devuelve.
+func findFreePort() (int, error) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return 0, err
+	}
+	defer l.Close()
+	return l.Addr().(*net.TCPAddr).Port, nil
+}
+
+// randomHex devuelve n bytes aleatorios codificados como hex string.
+func randomHex(n int) (string, error) {
+	buf := make([]byte, n)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(buf), nil
+}
+
+// writePasswordFile escribe la cookie a un archivo temporal con permisos 0600
+// y devuelve su path. El archivo se borra en Stop().
+func writePasswordFile(cookie string) (string, error) {
+	f, err := os.CreateTemp("", "navtunnel-mgmt-*.pw")
+	if err != nil {
+		return "", err
+	}
+	path := f.Name()
+	if err := os.Chmod(path, 0o600); err != nil {
+		_ = f.Close()
+		_ = os.Remove(path)
+		return "", err
+	}
+	if _, err := f.WriteString(cookie + "\n"); err != nil {
+		_ = f.Close()
+		_ = os.Remove(path)
+		return "", err
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(path)
+		return "", err
+	}
+	return path, nil
+}
+
+// dialManagement intenta conectar al socket management con reintentos
+// exponenciales dentro del timeout total. openvpn demora decenas a cientos
+// de ms en levantar el listener después de arrancar.
+func dialManagement(addr string, timeout time.Duration) (net.Conn, error) {
+	deadline := time.Now().Add(timeout)
+	wait := 50 * time.Millisecond
+	var lastErr error
+	for time.Now().Before(deadline) {
+		c, err := net.DialTimeout("tcp", addr, 500*time.Millisecond)
+		if err == nil {
+			return c, nil
+		}
+		lastErr = err
+		time.Sleep(wait)
+		if wait < 400*time.Millisecond {
+			wait *= 2
+		}
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("timeout")
+	}
+	return nil, lastErr
+}
+
+func stripLogPrefix(line string) string {
+	// >LOG:timestamp,flags,message → nos quedamos con el mensaje para la UI.
+	payload := strings.TrimPrefix(line, ">LOG:")
+	fields := strings.SplitN(payload, ",", 3)
+	if len(fields) < 3 {
+		return payload
+	}
+	return fields[2]
+}
+

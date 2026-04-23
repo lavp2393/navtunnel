@@ -234,8 +234,8 @@ func (a *App) openPanel() {
 	if a.server == nil {
 		return
 	}
-	if err := openBrowser(a.server.url()); err != nil {
-		a.addLog("No se pudo abrir el navegador: " + err.Error())
+	if err := openAppWindow(a.server.url()); err != nil {
+		a.addLog("No se pudo abrir la ventana del panel: " + err.Error())
 	}
 }
 

@@ -3,10 +3,25 @@ name: Release
 # Se dispara al empujar un tag semver (v1.2.3). Para generar una release:
 #   git tag -a v0.1.0 -m "First release"
 #   git push origin v0.1.0
+#
+# También se puede disparar manualmente desde la pestaña "Actions" con
+# workflow_dispatch para hacer un dry-run sin tag (usa el input "version"
+# como valor de main.version; no publica release si dry_run=true).
 on:
   push:
     tags:
       - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version string a inyectar en el binario (sin prefijo 'v')"
+        required: true
+        default: "dev-dispatch"
+      dry_run:
+        description: "Si true, solo construye artefactos; no crea release"
+        required: true
+        type: boolean
+        default: true
 
 permissions:
   contents: write
@@ -67,28 +82,37 @@ jobs:
           GOARCH: ${{ matrix.goarch }}
         run: |
           mkdir -p dist
-          tag="${GITHUB_REF_NAME}"
+          # En workflow_dispatch no hay tag: usa el input 'version'.
+          if [ -n "${{ inputs.version }}" ]; then
+            tag="${{ inputs.version }}"
+          else
+            tag="${GITHUB_REF_NAME}"
+          fi
+          echo "Building navtunnel ${tag} for ${GOOS}/${GOARCH}"
           out="dist/navtunnel${{ matrix.binext }}"
           go build -ldflags "-s -w -X main.version=${tag}" -o "${out}" ./cmd/navtunnel
+          "${out}" --version || true
 
       - name: Package (tar.gz)
         if: matrix.archive == 'tar.gz'
         shell: bash
         run: |
-          tag="${GITHUB_REF_NAME}"
+          if [ -n "${{ inputs.version }}" ]; then tag="${{ inputs.version }}"; else tag="${GITHUB_REF_NAME}"; fi
           name="navtunnel_${tag}_${{ matrix.goos }}_${{ matrix.goarch }}"
           cp README.md LICENSE dist/ 2>/dev/null || true
-          (cd dist && tar czf "${name}.tar.gz" navtunnel README.md LICENSE 2>/dev/null || tar czf "${name}.tar.gz" navtunnel)
+          (cd dist && tar czf "${name}.tar.gz" navtunnel $(ls README.md LICENSE 2>/dev/null))
           ls -lh dist/
 
       - name: Package (zip)
         if: matrix.archive == 'zip'
         shell: pwsh
         run: |
-          $tag = $env:GITHUB_REF_NAME
+          $tag = if ("${{ inputs.version }}") { "${{ inputs.version }}" } else { $env:GITHUB_REF_NAME }
           $name = "navtunnel_${tag}_${{ matrix.goos }}_${{ matrix.goarch }}"
-          Copy-Item README.md, LICENSE dist/ -ErrorAction SilentlyContinue
-          Compress-Archive -Path dist/navtunnel.exe, dist/README.md, dist/LICENSE -DestinationPath "dist/$name.zip" -ErrorAction SilentlyContinue
+          $files = @("dist/navtunnel.exe")
+          if (Test-Path "README.md") { Copy-Item README.md dist/; $files += "dist/README.md" }
+          if (Test-Path "LICENSE")   { Copy-Item LICENSE   dist/; $files += "dist/LICENSE" }
+          Compress-Archive -Path $files -DestinationPath "dist/$name.zip"
           Get-ChildItem dist
 
       - uses: actions/upload-artifact@v4
@@ -102,6 +126,9 @@ jobs:
     name: Publish GitHub Release
     needs: build
     runs-on: ubuntu-latest
+    # En workflow_dispatch con dry_run=true, solo dejamos los artefactos para
+    # inspección (descargables desde la corrida) y no creamos release.
+    if: ${{ github.event_name == 'push' || inputs.dry_run == false }}
     steps:
       - uses: actions/checkout@v4
         with:

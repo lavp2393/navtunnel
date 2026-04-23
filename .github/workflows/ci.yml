@@ -16,8 +16,10 @@ jobs:
         with:
           go-version: "1.22"
           cache: true
-      - name: Vet
-        run: go vet ./...
+      # vet/test solo en paquetes sin CGO. Los CGO (internal/ui/*) necesitan
+      # headers X11/GL; se validan en los jobs build.* de abajo.
+      - name: Vet (non-CGO packages)
+        run: go vet ./internal/core/... ./internal/config/... ./internal/logs/... ./internal/platform/... ./cmd/...
       - name: Unit tests (non-CGO packages)
         run: go test ./internal/core/... ./internal/config/... ./internal/logs/...
 

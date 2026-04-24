@@ -3,7 +3,7 @@
 #      docker run --rm -v $(pwd)/dist:/dist navtunnel-builder
 
 # Stage 1: Builder
-FROM golang:1.22-bookworm AS builder
+FROM golang:1.24-bookworm AS builder
 
 # Instalar solo dependencias necesarias para compilar
 RUN apt-get update && apt-get install -y \

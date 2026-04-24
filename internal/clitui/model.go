@@ -244,8 +244,16 @@ func (m model) handleEvent(env daemon.Envelope) model {
 		var p daemon.DisconnectedPayload
 		_ = json.Unmarshal(env.Payload, &p)
 		m.state = "DESCONECTADO"
+		m.tunIP = ""
+		m.remoteIP = ""
+		m.bytesIn = 0
+		m.bytesOut = 0
 		m.rateIn = 0
 		m.rateOut = 0
+		// Empujar una muestra de cero al chart para que la línea caiga
+		// visualmente en vez de quedar pintada como si hubiera tráfico.
+		m.rxBuf = appendSample(m.rxBuf, 0, 120)
+		m.txBuf = appendSample(m.txBuf, 0, 120)
 	case daemon.EvtAuthFailed:
 		var p daemon.AuthFailedPayload
 		_ = json.Unmarshal(env.Payload, &p)

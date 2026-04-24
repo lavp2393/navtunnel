@@ -328,15 +328,26 @@ func (s *Server) pumpEvents(mgr *core.Manager) {
 	for ev := range mgr.Events() {
 		s.routeEvent(ev)
 	}
-	// Canal cerrado: limpiar state.
+	// Canal cerrado: limpiar state por completo (estado, IPs, rates, bytes)
+	// y emitir un snapshot "clean" para que la UI reinicie todas las tarjetas
+	// de métricas. Sin esto, tunIP/remoteIP/rateIn/rateOut quedarían con los
+	// últimos valores y parecería que seguimos conectados.
 	s.mu.Lock()
 	if s.manager == mgr {
 		s.manager = nil
 		s.sendFns = core.SendFns{}
 	}
 	s.mu.Unlock()
-	s.updateMetricsState("DISCONNECTED", "", "")
+	s.resetMetrics()
+	s.broadcast(EvtState, s.snapshotMetrics())
 	s.broadcast(EvtDisconnect, DisconnectedPayload{Reason: "manager closed"})
+}
+
+// resetMetrics vuelve el snapshot a cero. Se llama cuando el Manager muere.
+func (s *Server) resetMetrics() {
+	s.metricsMu.Lock()
+	defer s.metricsMu.Unlock()
+	s.metrics = StatePayload{State: "DISCONNECTED"}
 }
 
 func (s *Server) routeEvent(ev core.Event) {

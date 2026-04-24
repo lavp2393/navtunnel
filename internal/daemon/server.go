@@ -102,6 +102,14 @@ func (s *Server) Serve() error {
 	}
 	defer removeInfo()
 
+	// Si una sesión anterior dejó un openvpn huérfano (navtunnel-cli
+	// asesinado antes de desconectar limpio), lo matamos acá. Sólo tocamos
+	// procesos con nuestra firma (--management-hold + pw-file prefix
+	// "navtunnel-mgmt-"); cualquier otro openvpn queda intacto.
+	if n := killOrphanOpenVPN(); n > 0 {
+		s.log(fmt.Sprintf("limpiados %d proceso(s) openvpn huérfano(s) de sesión previa", n))
+	}
+
 	s.log(fmt.Sprintf("daemon listening on 127.0.0.1:%d", port))
 
 	go s.acceptLoop()

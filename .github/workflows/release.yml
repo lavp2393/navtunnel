@@ -60,7 +60,7 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.22"
+          go-version: "1.24"
           cache: true
 
       # Fyne necesita headers X11/OpenGL + AppIndicator para el tray en Linux.
@@ -74,10 +74,9 @@ jobs:
             libxrandr-dev libxcursor-dev libxinerama-dev libxi-dev libxxf86vm-dev \
             libayatana-appindicator3-dev
 
-      - name: Build navtunnel
+      - name: Build binaries (navtunnel GUI + navtunnel-cli TUI)
         shell: bash
         env:
-          CGO_ENABLED: "1"
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
         run: |
@@ -88,35 +87,42 @@ jobs:
           else
             tag="${GITHUB_REF_NAME}"
           fi
-          echo "Building navtunnel ${tag} for ${GOOS}/${GOARCH}"
-          out="dist/navtunnel${{ matrix.binext }}"
+          echo "Building ${tag} for ${GOOS}/${GOARCH}"
+
+          # --- navtunnel (GUI Fyne, CGO=1) ---
           # macOS: getlantern/systray dispara duplicate-symbol con el linker
           # moderno de Xcode 15+. -ld_classic cae al linker anterior.
           # https://github.com/getlantern/systray/issues/317
-          ldflags="-s -w -X main.version=${tag}"
+          guiLdflags="-s -w -X main.version=${tag}"
           if [ "${GOOS}" = "darwin" ]; then
-            ldflags="${ldflags} -extldflags=-Wl,-ld_classic"
+            guiLdflags="${guiLdflags} -extldflags=-Wl,-ld_classic"
           fi
-          go build -ldflags "${ldflags}" -o "${out}" ./cmd/navtunnel
-          "${out}" --version || true
+          CGO_ENABLED=1 go build -ldflags "${guiLdflags}" \
+            -o "dist/navtunnel${{ matrix.binext }}" ./cmd/navtunnel
+          "dist/navtunnel${{ matrix.binext }}" --version || true
 
-      - name: Package (tar.gz)
+          # --- navtunnel-cli (TUI bubbletea, CGO=0 — Go puro) ---
+          CGO_ENABLED=0 go build -ldflags "-s -w -X main.version=${tag}" \
+            -o "dist/navtunnel-cli${{ matrix.binext }}" ./cmd/navtunnel-cli
+          "dist/navtunnel-cli${{ matrix.binext }}" --version || true
+
+      - name: Package (tar.gz) — includes both binaries
         if: matrix.archive == 'tar.gz'
         shell: bash
         run: |
           if [ -n "${{ inputs.version }}" ]; then tag="${{ inputs.version }}"; else tag="${GITHUB_REF_NAME}"; fi
           name="navtunnel_${tag}_${{ matrix.goos }}_${{ matrix.goarch }}"
           cp README.md LICENSE dist/ 2>/dev/null || true
-          (cd dist && tar czf "${name}.tar.gz" navtunnel $(ls README.md LICENSE 2>/dev/null))
+          (cd dist && tar czf "${name}.tar.gz" navtunnel navtunnel-cli $(ls README.md LICENSE 2>/dev/null))
           ls -lh dist/
 
-      - name: Package (zip)
+      - name: Package (zip) — includes both binaries
         if: matrix.archive == 'zip'
         shell: pwsh
         run: |
           $tag = if ("${{ inputs.version }}") { "${{ inputs.version }}" } else { $env:GITHUB_REF_NAME }
           $name = "navtunnel_${tag}_${{ matrix.goos }}_${{ matrix.goarch }}"
-          $files = @("dist/navtunnel.exe")
+          $files = @("dist/navtunnel.exe", "dist/navtunnel-cli.exe")
           if (Test-Path "README.md") { Copy-Item README.md dist/; $files += "dist/README.md" }
           if (Test-Path "LICENSE")   { Copy-Item LICENSE   dist/; $files += "dist/LICENSE" }
           Compress-Archive -Path $files -DestinationPath "dist/$name.zip"

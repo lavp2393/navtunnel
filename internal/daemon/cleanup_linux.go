@@ -1,9 +1,10 @@
+//go:build linux
+
 package daemon
 
 import (
 	"os"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -31,9 +32,6 @@ const (
 // Usa SIGTERM, no SIGKILL: si openvpn está vivo y sano, sale limpio
 // liberando el tun device y las rutas que haya agregado.
 func killOrphanOpenVPN() int {
-	if runtime.GOOS != "linux" {
-		return 0
-	}
 	entries, err := os.ReadDir("/proc")
 	if err != nil {
 		return 0

@@ -79,12 +79,13 @@ var (
 
 	logLineStyle = lipgloss.NewStyle().Foreground(colorDim)
 
+	// promptBox es el "popup" de credenciales. El ancho se setea dinámicamente
+	// desde renderPrompt() según el tamaño de la terminal.
 	promptBox = lipgloss.NewStyle().
 			Border(borderStyle).
 			BorderForeground(colorCyan).
 			Padding(1, 2).
-			Foreground(colorText).
-			Width(56)
+			Foreground(colorText)
 
 	promptTitle = lipgloss.NewStyle().
 			Foreground(colorCyan).

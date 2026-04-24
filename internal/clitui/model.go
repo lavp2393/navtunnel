@@ -312,15 +312,35 @@ func appendLog(buf []string, line string, max int) []string {
 // --- View -------------------------------------------------------------------
 
 func (m model) View() string {
-	if m.width == 0 {
+	if m.width == 0 || m.height == 0 {
 		return "Inicializando..."
 	}
-	contentWidth := m.width
-	if contentWidth > 110 {
-		contentWidth = 110
+
+	// Si hay prompt activo, ocupamos toda la pantalla con el popup
+	// centrado — se siente como modal de verdad en vez de un cuadro
+	// colado abajo del dashboard.
+	if m.prompt != nil {
+		return lipgloss.Place(
+			m.width, m.height,
+			lipgloss.Center, lipgloss.Center,
+			m.renderPrompt(),
+		)
 	}
 
-	parts := []string{m.renderHeader(contentWidth), m.renderTabs(contentWidth)}
+	// Ancho del contenido: mínimo 60, máximo 120, adaptativo a la terminal
+	// con un margen lateral de 4 columnas.
+	contentWidth := m.width - 4
+	if contentWidth < 60 {
+		contentWidth = m.width
+	}
+	if contentWidth > 120 {
+		contentWidth = 120
+	}
+
+	parts := []string{
+		m.renderHeader(contentWidth),
+		m.renderTabs(contentWidth),
+	}
 	if m.active == tabDashboard {
 		parts = append(parts, m.renderDashboard(contentWidth))
 	} else {
@@ -328,15 +348,15 @@ func (m model) View() string {
 	}
 	parts = append(parts, m.renderHelp(contentWidth))
 
-	out := lipgloss.JoinVertical(lipgloss.Left, parts...)
-	if m.prompt != nil {
-		out = m.overlayPrompt(out)
-	}
+	body := lipgloss.JoinVertical(lipgloss.Left, parts...)
+
 	if m.err != "" {
 		banner := errStyle.Render("✗ " + m.err)
-		out = lipgloss.JoinVertical(lipgloss.Left, out, banner)
+		body = lipgloss.JoinVertical(lipgloss.Left, body, banner)
 	}
-	return out
+
+	// Centrar horizontalmente todo el dashboard en la terminal.
+	return lipgloss.PlaceHorizontal(m.width, lipgloss.Center, body)
 }
 
 func (m model) renderHeader(w int) string {
@@ -468,10 +488,10 @@ func checkbox(b bool) string {
 	return " "
 }
 
-// overlayPrompt superpone el prompt como un cuadro centrado al final del
-// output actual (bubbletea no tiene overlays reales; aproximamos con una
-// caja debajo del contenido y un help line actualizado).
-func (m model) overlayPrompt(base string) string {
+// renderPrompt dibuja el modal de autenticación como una única caja
+// pensada para ocupar el centro de la pantalla. La envoltura de
+// lipgloss.Place() en View() la posiciona horizontal+verticalmente.
+func (m model) renderPrompt() string {
 	title := strings.ToUpper(m.prompt.stage)
 	switch m.prompt.stage {
 	case "user":
@@ -481,12 +501,31 @@ func (m model) overlayPrompt(base string) string {
 	case "otp":
 		title = "CÓDIGO OTP"
 	}
+
+	// El width del popup crece con la terminal pero queda contenido.
+	boxWidth := 56
+	if m.width < 60 {
+		boxWidth = m.width - 4
+	}
+	if boxWidth < 30 {
+		boxWidth = 30
+	}
+
+	help := helpStyle.Render("enter: enviar · esc: cancelar · ctrl+r: recordar [" + checkbox(m.rememberCreds) + "]")
+
+	// En el OTP no se ofrece "recordar" — es single-use por definición.
+	if m.prompt.stage == "otp" {
+		help = helpStyle.Render("enter: enviar · esc: cancelar")
+	}
+
 	content := lipgloss.JoinVertical(lipgloss.Left,
-		promptTitle.Render(title),
+		promptTitle.Render("◈ "+title),
+		"",
 		dimStyle.Render(m.prompt.message),
 		"",
 		m.input.View(),
+		"",
+		help,
 	)
-	box := promptBox.Render(content)
-	return lipgloss.JoinVertical(lipgloss.Left, base, "", box)
+	return promptBox.Width(boxWidth).Render(content)
 }

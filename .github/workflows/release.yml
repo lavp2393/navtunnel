@@ -90,7 +90,14 @@ jobs:
           fi
           echo "Building navtunnel ${tag} for ${GOOS}/${GOARCH}"
           out="dist/navtunnel${{ matrix.binext }}"
-          go build -ldflags "-s -w -X main.version=${tag}" -o "${out}" ./cmd/navtunnel
+          # macOS: getlantern/systray dispara duplicate-symbol con el linker
+          # moderno de Xcode 15+. -ld_classic cae al linker anterior.
+          # https://github.com/getlantern/systray/issues/317
+          ldflags="-s -w -X main.version=${tag}"
+          if [ "${GOOS}" = "darwin" ]; then
+            ldflags="${ldflags} -extldflags=-Wl,-ld_classic"
+          fi
+          go build -ldflags "${ldflags}" -o "${out}" ./cmd/navtunnel
           "${out}" --version || true
 
       - name: Package (tar.gz)

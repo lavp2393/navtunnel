@@ -16,10 +16,11 @@ jobs:
         with:
           go-version: "1.22"
           cache: true
-      # vet/test solo en paquetes sin CGO. Los CGO (internal/ui/*) necesitan
-      # headers X11/GL; se validan en los jobs build.* de abajo.
+      # vet/test solo en paquetes sin CGO. Los CGO (internal/ui/*, y ./cmd
+      # vía su import de internal/ui) necesitan headers X11/GL; se validan
+      # en los jobs build.* de abajo.
       - name: Vet (non-CGO packages)
-        run: go vet ./internal/core/... ./internal/config/... ./internal/logs/... ./internal/platform/... ./cmd/...
+        run: go vet ./internal/core/... ./internal/config/... ./internal/logs/... ./internal/platform/...
       - name: Unit tests (non-CGO packages)
         run: go test ./internal/core/... ./internal/config/... ./internal/logs/...
 
@@ -54,4 +55,12 @@ jobs:
         shell: bash
         env:
           CGO_ENABLED: "1"
-        run: go build -o /dev/null ./cmd/navtunnel
+        run: |
+          # En macOS, getlantern/systray genera duplicate-symbol errors con
+          # el linker moderno de Xcode 15+. -ld_classic usa el linker previo
+          # (bug: https://github.com/getlantern/systray/issues/317).
+          if [ "${{ matrix.goos }}" = "darwin" ]; then
+            go build -ldflags "-extldflags=-Wl,-ld_classic" -o /dev/null ./cmd/navtunnel
+          else
+            go build -o /dev/null ./cmd/navtunnel
+          fi

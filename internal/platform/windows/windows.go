@@ -48,7 +48,7 @@ func (p *WindowsPlatform) RequiresElevation() bool { return true }
 // No usamos "runas" porque requiere credenciales; no usamos Start-Process
 // -Verb RunAs porque el proceso hijo correría en una sesión separada y
 // perderíamos stdout/stderr y el PID.
-func (p *WindowsPlatform) ElevateCommand(path string, args []string) (string, []string, error) {
+func (p *WindowsPlatform) ElevateCommand(path string, args []string, _ bool) (string, []string, error) {
 	if !isElevated() {
 		return "", nil, fmt.Errorf("NavTunnel requiere ejecutarse como Administrador para controlar el adaptador TAP")
 	}

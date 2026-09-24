@@ -8,9 +8,14 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"runtime"
 	"strconv"
 	"time"
+
+	"golang.org/x/term"
 )
+
+var errDaemonStatusUnsupported = errors.New("daemon status command unsupported")
 
 // Client representa la conexión del TUI al daemon.
 type Client struct {
@@ -93,14 +98,57 @@ func (c *Client) Close() error { return c.conn.Close() }
 // un subproceso con NAVTUNNEL_CLI_DAEMON=1 desacoplado del cliente y
 // espera hasta que aparezca el archivo + el socket responda, con timeout.
 func EnsureDaemon(exe string) error {
+	ttyPath, consoleTTY := currentConsoleTTY()
 	if pingExistingDaemon() {
-		return nil
+		info, _, err := ReadInfo()
+		if err != nil || !consoleTTY || info.ConsoleTTY == ttyPath {
+			return nil
+		}
+
+		connected, err := queryDaemonConnected(info)
+		if err != nil {
+			if errors.Is(err, errDaemonStatusUnsupported) {
+				// Legacy daemons cannot report their Manager state. Keep them if
+				// their OpenVPN process is present; otherwise rotate the idle daemon
+				// so sudo can use the current terminal's authorization ticket.
+				if hasManagedOpenVPN() {
+					return nil
+				}
+				if _, err := sendDaemonRequest(info, CmdShutdown, "shutdown-legacy"); err != nil {
+					return fmt.Errorf("no se pudo cerrar el daemon anterior: %w", err)
+				}
+				if err := waitDaemonExit(info.PID); err != nil {
+					return err
+				}
+			} else {
+				return fmt.Errorf("el daemon pertenece a otra sesión SSH y no pude comprobar si la VPN sigue activa: %w; no lo detuve", err)
+			}
+		} else {
+			if connected {
+				// No interrumpir una VPN activa. Al salir y volver a abrir navt
+				// cuando esté desconectada, se podrá asociar al TTY nuevo.
+				return nil
+			}
+			stopped, err := shutdownDaemonIfIdle(info)
+			if err != nil {
+				return fmt.Errorf("no se pudo reiniciar el daemon de la sesión SSH anterior: %w", err)
+			}
+			if !stopped {
+				return errors.New("el daemon inició una conexión mientras cambiaba la sesión SSH; vuelve a ejecutar navt")
+			}
+			if err := waitDaemonExit(info.PID); err != nil {
+				return err
+			}
+		}
 	}
 	// Borrar info viejo si existe (daemon murió sin limpiar).
 	removeInfo()
 
 	cmd := exec.Command(exe)
 	cmd.Env = append(os.Environ(), "NAVTUNNEL_CLI_DAEMON=1")
+	if consoleTTY {
+		cmd.Env = append(cmd.Env, "NAVTUNNEL_CLI_TTY="+ttyPath)
+	}
 	// Redirigir stdout/stderr/stdin a /dev/null para que el daemon no
 	// herede el tty del cliente ni retenga FDs bloqueantes.
 	devnull, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
@@ -110,7 +158,7 @@ func EnsureDaemon(exe string) error {
 		cmd.Stderr = devnull
 		defer devnull.Close()
 	}
-	detachFromParent(cmd)
+	detachFromParent(cmd, consoleTTY)
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("spawn daemon: %w", err)
 	}
@@ -133,6 +181,90 @@ func EnsureDaemon(exe string) error {
 		time.Sleep(150 * time.Millisecond)
 	}
 	return errors.New("el daemon no arrancó a tiempo")
+}
+
+func currentConsoleTTY() (string, bool) {
+	if runtime.GOOS != "linux" || !term.IsTerminal(int(os.Stdin.Fd())) || !term.IsTerminal(int(os.Stderr.Fd())) {
+		return "", false
+	}
+	path, err := os.Readlink(fmt.Sprintf("/proc/self/fd/%d", os.Stdin.Fd()))
+	if err != nil || len(path) < len("/dev/") || path[:len("/dev/")] != "/dev/" {
+		return "", false
+	}
+	return path, true
+}
+
+func queryDaemonConnected(info InfoFile) (bool, error) {
+	reply, err := sendDaemonRequest(info, CmdStatus, "status")
+	if err != nil {
+		return false, err
+	}
+	if !reply.OK {
+		if reply.Error == "unknown command: status" {
+			return false, errDaemonStatusUnsupported
+		}
+		return false, errors.New(reply.Error)
+	}
+	return reply.Connected, nil
+}
+
+func shutdownDaemonIfIdle(info InfoFile) (bool, error) {
+	reply, err := sendDaemonRequest(info, CmdShutdownIfIdle, "shutdown-if-idle")
+	if err != nil {
+		return false, err
+	}
+	if !reply.OK && reply.Connected {
+		return false, nil
+	}
+	if !reply.OK {
+		return false, errors.New(reply.Error)
+	}
+	return true, nil
+}
+
+func sendDaemonRequest(info InfoFile, command, id string) (ReplyPayload, error) {
+	conn, err := net.DialTimeout("tcp", "127.0.0.1:"+strconv.Itoa(info.Port), 2*time.Second)
+	if err != nil {
+		return ReplyPayload{}, err
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+	if _, err := conn.Write([]byte(info.Token + "\n")); err != nil {
+		return ReplyPayload{}, err
+	}
+	enc := json.NewEncoder(conn)
+	if err := enc.Encode(CommandEnvelope{Type: command, ID: id}); err != nil {
+		return ReplyPayload{}, err
+	}
+	dec := json.NewDecoder(bufio.NewReader(conn))
+	for {
+		var env Envelope
+		if err := dec.Decode(&env); err != nil {
+			return ReplyPayload{}, err
+		}
+		if env.Type != EvtReply {
+			continue
+		}
+		var reply ReplyPayload
+		if err := json.Unmarshal(env.Payload, &reply); err != nil {
+			return ReplyPayload{}, err
+		}
+		if reply.ID == id {
+			return reply, nil
+		}
+	}
+}
+
+func waitDaemonExit(pid int) error {
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if !processAlive(pid) {
+			removeInfo()
+			return nil
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return errors.New("el daemon anterior no terminó a tiempo; no inicié otro")
 }
 
 // pingExistingDaemon devuelve true si hay un daemon vivo reachable con el
@@ -161,4 +293,3 @@ func pingExistingDaemon() bool {
 	}
 	return true
 }
-

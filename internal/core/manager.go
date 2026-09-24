@@ -105,6 +105,12 @@ type Manager struct {
 // archivo .ovpn del usuario; openvpnBinary es opcional (se busca en PATH si
 // está vacío).
 func Start(ovpnPath, openvpnBinary string) (*Manager, error) {
+	return StartWithConsoleElevation(ovpnPath, openvpnBinary, false)
+}
+
+// StartWithConsoleElevation allows the CLI to authorize sudo from its TTY
+// before launching OpenVPN. GUI callers keep the platform's native prompt.
+func StartWithConsoleElevation(ovpnPath, openvpnBinary string, console bool) (*Manager, error) {
 	if openvpnBinary == "" {
 		var err error
 		openvpnBinary, err = FindOpenVPN()
@@ -138,7 +144,7 @@ func Start(ovpnPath, openvpnBinary string) (*Manager, error) {
 	}
 
 	plat := platform.New()
-	program, fullArgs, err := plat.ElevateCommand(openvpnBinary, args)
+	program, fullArgs, err := plat.ElevateCommand(openvpnBinary, args, console)
 	if err != nil {
 		_ = os.Remove(pwFile)
 		return nil, fmt.Errorf("preparando elevación: %w", err)
@@ -706,4 +712,3 @@ func stripLogPrefix(line string) string {
 	}
 	return fields[2]
 }
-

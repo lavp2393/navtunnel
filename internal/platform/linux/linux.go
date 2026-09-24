@@ -38,7 +38,17 @@ func (p *LinuxPlatform) RequiresElevation() bool { return true }
 
 // ElevateCommand usa pkexec para pedir la autenticación de policykit.
 // Requiere un entorno gráfico con policykit-1 instalado (polkit agent).
-func (p *LinuxPlatform) ElevateCommand(path string, args []string) (string, []string, error) {
+func (p *LinuxPlatform) ElevateCommand(path string, args []string, console bool) (string, []string, error) {
+	// El cliente CLI autoriza sudo desde la terminal SSH al pulsar Conectar.
+	// El daemon conserva la sesión TTY para reutilizar ese ticket de sudo.
+	if console {
+		if _, err := exec.LookPath("sudo"); err != nil {
+			return "", nil, fmt.Errorf("sudo no disponible para autenticación por consola: %w", err)
+		}
+		elevatedArgs := append([]string{"-n", path}, args...)
+		return "sudo", elevatedArgs, nil
+	}
+
 	if _, err := exec.LookPath("pkexec"); err != nil {
 		return "", nil, fmt.Errorf("pkexec no disponible. Instala policykit-1: sudo apt install policykit-1")
 	}

@@ -17,11 +17,11 @@ func NewDarwin() *DarwinPlatform { return &DarwinPlatform{} }
 // FindOpenVPN busca openvpn en las rutas típicas de Homebrew y en $PATH.
 func (p *DarwinPlatform) FindOpenVPN() (string, error) {
 	paths := []string{
-		"/opt/homebrew/sbin/openvpn",                             // Apple Silicon Homebrew
-		"/opt/homebrew/opt/openvpn/sbin/openvpn",                 // Apple Silicon Homebrew (cellar)
-		"/usr/local/sbin/openvpn",                                // Intel Homebrew
-		"/usr/local/opt/openvpn/sbin/openvpn",                    // Intel Homebrew (cellar)
-		"/usr/local/bin/openvpn",                                 // Manual/otros
+		"/opt/homebrew/sbin/openvpn",             // Apple Silicon Homebrew
+		"/opt/homebrew/opt/openvpn/sbin/openvpn", // Apple Silicon Homebrew (cellar)
+		"/usr/local/sbin/openvpn",                // Intel Homebrew
+		"/usr/local/opt/openvpn/sbin/openvpn",    // Intel Homebrew (cellar)
+		"/usr/local/bin/openvpn",                 // Manual/otros
 		"/Applications/Tunnelblick.app/Contents/Resources/openvpn",
 	}
 	for _, path := range paths {
@@ -47,7 +47,7 @@ func (p *DarwinPlatform) RequiresElevation() bool { return true }
 // NOTA: al matar el proceso padre (osascript), macOS no propaga la señal al
 // openvpn elevado. El Manager hace shutdown limpio vía management socket
 // ("signal SIGTERM") antes de caer al Kill del padre.
-func (p *DarwinPlatform) ElevateCommand(path string, args []string) (string, []string, error) {
+func (p *DarwinPlatform) ElevateCommand(path string, args []string, _ bool) (string, []string, error) {
 	parts := []string{shellQuote(path)}
 	for _, a := range args {
 		parts = append(parts, shellQuote(a))

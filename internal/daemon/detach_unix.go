@@ -9,9 +9,16 @@ import (
 
 const isUnix = true
 
-// detachFromParent deja al daemon sobreviviendo al cliente: nueva session
-// (Setsid) para que no herede el tty y no reciba SIGHUP cuando el padre sale.
-func detachFromParent(cmd *exec.Cmd) {
+// detachFromParent separa al daemon del grupo de procesos del cliente.
+// En modo consola conserva la sesión TTY para sudo; en otros casos crea una
+// sesión nueva y elimina la dependencia de la terminal.
+func detachFromParent(cmd *exec.Cmd, consoleTTY bool) {
+	if consoleTTY {
+		// A new process group separates the daemon from the shell's foreground
+		// job while retaining its session tty for sudo's tty-scoped ticket.
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+		return
+	}
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 }
 

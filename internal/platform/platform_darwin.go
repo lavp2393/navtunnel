@@ -16,8 +16,8 @@ func NewDarwin() Platform {
 
 func (a *darwinAdapter) FindOpenVPN() (string, error) { return a.impl.FindOpenVPN() }
 func (a *darwinAdapter) RequiresElevation() bool      { return a.impl.RequiresElevation() }
-func (a *darwinAdapter) ElevateCommand(path string, args []string) (string, []string, error) {
-	return a.impl.ElevateCommand(path, args)
+func (a *darwinAdapter) ElevateCommand(path string, args []string, console bool) (string, []string, error) {
+	return a.impl.ElevateCommand(path, args, console)
 }
 func (a *darwinAdapter) GetConfigDir() string         { return a.impl.GetConfigDir() }
 func (a *darwinAdapter) GetDefaultConfigPath() string { return a.impl.GetDefaultConfigPath() }

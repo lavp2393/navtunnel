@@ -14,10 +14,11 @@ type Platform interface {
 	RequiresElevation() bool
 
 	// ElevateCommand traduce (path, args) al par (program, args) equivalente
-	// ejecutado con privilegios. En Linux es pkexec; en macOS osascript;
+	// ejecutado con privilegios. En Linux es pkexec o sudo según console;
+	// en macOS osascript;
 	// en Windows se asume que el proceso padre ya es Admin y devuelve
 	// (path, args) sin cambios, o error si no lo es.
-	ElevateCommand(path string, args []string) (string, []string, error)
+	ElevateCommand(path string, args []string, console bool) (string, []string, error)
 
 	// GetConfigDir es el directorio donde guardar config de usuario (XDG en
 	// Linux, Application Support en macOS, APPDATA en Windows).

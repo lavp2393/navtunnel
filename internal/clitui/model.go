@@ -3,12 +3,16 @@ package clitui
 import (
 	"encoding/json"
 	"fmt"
+	"os"
+	"os/exec"
+	"runtime"
 	"strings"
 	"time"
 
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"golang.org/x/term"
 
 	"github.com/lavp2393/navtunnel/internal/daemon"
 )
@@ -27,6 +31,7 @@ func Run(c *daemon.Client) error {
 type daemonEventMsg struct{ Envelope daemon.Envelope }
 type daemonClosedMsg struct{}
 type tickMsg time.Time
+type sudoAuthMsg struct{ err error }
 
 // --- Estado del modelo ------------------------------------------------------
 
@@ -67,8 +72,11 @@ type model struct {
 	prompt *promptState
 	input  textinput.Model
 
-	rememberCreds bool
-	err           string
+	rememberCreds    bool
+	consoleElevation bool
+	consoleTTY       string
+	daemonConsoleTTY string
+	err              string
 }
 
 func newModel(c *daemon.Client) model {
@@ -79,13 +87,16 @@ func newModel(c *daemon.Client) model {
 	in.PromptStyle = cyanStyle
 	in.TextStyle = valueStyle
 
+	ttyPath, consoleElevation := currentConsoleTTY()
 	return model{
-		client:        c,
-		rxBuf:         make([]float64, 0, 120),
-		txBuf:         make([]float64, 0, 120),
-		input:         in,
-		state:         "DESCONECTADO",
-		rememberCreds: true,
+		client:           c,
+		rxBuf:            make([]float64, 0, 120),
+		txBuf:            make([]float64, 0, 120),
+		input:            in,
+		state:            "DESCONECTADO",
+		rememberCreds:    true,
+		consoleElevation: consoleElevation,
+		consoleTTY:       ttyPath,
 	}
 }
 
@@ -136,6 +147,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tickMsg:
 		// redraw periódico para que los rates "envejezcan" si no llegan updates.
 		return m, tickEvery()
+
+	case sudoAuthMsg:
+		if msg.err != nil {
+			m.err = "No se pudo autorizar sudo: " + msg.err.Error()
+			return m, nil
+		}
+		m.err = ""
+		return m, m.sendCmd(daemon.CmdConnect, daemon.ConnectPayload{ConsoleElevation: true})
 	}
 	return m, nil
 }
@@ -167,6 +186,26 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "q", "ctrl+c":
 		return m, tea.Quit
 	case "c":
+		if m.consoleElevation {
+			if connectionActive(m.state) {
+				return m, nil
+			}
+			if m.daemonConsoleTTY != "" && m.daemonConsoleTTY != m.consoleTTY {
+				m.err = "El daemon pertenece a otra sesión SSH. Salí con q y volvé a ejecutar navt; se reiniciará automáticamente cuando la VPN esté desconectada."
+				return m, nil
+			}
+			if m.ovpn == "" {
+				return m, m.sendCmd(daemon.CmdConnect, nil)
+			}
+			sudo, err := exec.LookPath("sudo")
+			if err != nil {
+				m.err = "sudo no disponible: " + err.Error()
+				return m, nil
+			}
+			return m, tea.ExecProcess(exec.Command(sudo, "-v"), func(err error) tea.Msg {
+				return sudoAuthMsg{err: err}
+			})
+		}
 		return m, m.sendCmd(daemon.CmdConnect, nil)
 	case "d":
 		return m, m.sendCmd(daemon.CmdDisconnect, nil)
@@ -189,6 +228,26 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+func currentConsoleTTY() (string, bool) {
+	if runtime.GOOS != "linux" || !term.IsTerminal(int(os.Stdin.Fd())) || !term.IsTerminal(int(os.Stderr.Fd())) {
+		return "", false
+	}
+	path, err := os.Readlink(fmt.Sprintf("/proc/self/fd/%d", os.Stdin.Fd()))
+	if err != nil || !strings.HasPrefix(path, "/dev/") {
+		return "", false
+	}
+	return path, true
+}
+
+func connectionActive(state string) bool {
+	switch strings.ToUpper(state) {
+	case "", "DESCONECTADO", "DISCONNECTED":
+		return false
+	default:
+		return true
+	}
+}
+
 // handleEvent procesa un envelope del daemon y devuelve el modelo modificado.
 func (m model) handleEvent(env daemon.Envelope) model {
 	switch env.Type {
@@ -197,6 +256,7 @@ func (m model) handleEvent(env daemon.Envelope) model {
 		_ = json.Unmarshal(env.Payload, &p)
 		m.version = p.Version
 		m.ovpn = p.OvpnPath
+		m.daemonConsoleTTY = p.ConsoleTTY
 	case daemon.EvtState:
 		var p daemon.StatePayload
 		_ = json.Unmarshal(env.Payload, &p)

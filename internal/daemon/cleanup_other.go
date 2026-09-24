@@ -7,3 +7,6 @@ package daemon
 // en Windows con ToolHelp32 snapshot. Por ahora el cleanup corre sólo en
 // Linux y en otros OS la limpieza queda a manos del usuario.
 func killOrphanOpenVPN() int { return 0 }
+
+// hasManagedOpenVPN cannot be determined without platform-specific process inspection.
+func hasManagedOpenVPN() bool { return true }

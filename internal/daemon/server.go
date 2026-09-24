@@ -31,9 +31,11 @@ type Server struct {
 	cfg    *config.Config
 	logBuf *logs.Buffer
 
-	mu      sync.Mutex
-	manager *core.Manager
-	sendFns core.SendFns
+	mu         sync.Mutex
+	manager    *core.Manager
+	connecting bool
+	stopping   bool
+	sendFns    core.SendFns
 
 	credMu        sync.Mutex
 	savedUser     string
@@ -97,7 +99,10 @@ func (s *Server) Serve() error {
 	}
 	s.token = token
 
-	if _, err := writeInfo(InfoFile{Port: port, Token: token, PID: os.Getpid()}); err != nil {
+	if _, err := writeInfo(InfoFile{
+		Port: port, Token: token, PID: os.Getpid(),
+		ConsoleTTY: os.Getenv("NAVTUNNEL_CLI_TTY"),
+	}); err != nil {
 		return fmt.Errorf("write info: %w", err)
 	}
 	defer removeInfo()
@@ -192,7 +197,10 @@ func (s *Server) serveClient(conn net.Conn) {
 	}()
 
 	// Hello + snapshot inicial.
-	_ = c.send(EvtHello, HelloPayload{Version: s.version, OvpnPath: s.cfg.VPNConfigPath})
+	_ = c.send(EvtHello, HelloPayload{
+		Version: s.version, OvpnPath: s.cfg.VPNConfigPath,
+		ConsoleTTY: os.Getenv("NAVTUNNEL_CLI_TTY"),
+	})
 	_ = c.send(EvtState, s.snapshotMetrics())
 	for _, l := range s.logBuf.GetAll() {
 		_ = c.send(EvtLog, LogPayload{Line: l})
@@ -222,13 +230,38 @@ func (s *Server) dispatch(c *client, cmd CommandEnvelope) {
 	case CmdPing:
 		reply(true, "")
 
+	case CmdStatus:
+		s.mu.Lock()
+		connected := s.manager != nil || s.connecting
+		s.mu.Unlock()
+		_ = c.send(EvtReply, ReplyPayload{ID: cmd.ID, OK: true, Connected: connected})
+
+	case CmdShutdownIfIdle:
+		s.mu.Lock()
+		if s.manager != nil || s.connecting {
+			s.mu.Unlock()
+			_ = c.send(EvtReply, ReplyPayload{ID: cmd.ID, OK: false, Connected: true})
+			return
+		}
+		s.stopping = true
+		s.mu.Unlock()
+		_ = c.send(EvtReply, ReplyPayload{ID: cmd.ID, OK: true})
+		go s.Shutdown()
+
 	case CmdSubscribe:
 		// El cliente ya está suscripto por default en serveClient; este comando
 		// se mantiene por simetría futura.
 		reply(true, "")
 
 	case CmdConnect:
-		if err := s.connect(); err != nil {
+		var p ConnectPayload
+		if len(cmd.Payload) > 0 {
+			if err := json.Unmarshal(cmd.Payload, &p); err != nil {
+				reply(false, "invalid payload: "+err.Error())
+				return
+			}
+		}
+		if err := s.connect(p.ConsoleElevation); err != nil {
 			reply(false, err.Error())
 			return
 		}
@@ -273,6 +306,9 @@ func (s *Server) dispatch(c *client, cmd CommandEnvelope) {
 
 // Shutdown solicita el cierre ordenado del daemon.
 func (s *Server) Shutdown() {
+	s.mu.Lock()
+	s.stopping = true
+	s.mu.Unlock()
 	s.stopOnce.Do(func() { close(s.shutdownCh) })
 }
 
@@ -281,29 +317,42 @@ func (s *Server) ShutdownCh() <-chan struct{} { return s.shutdownCh }
 
 // --- Manager lifecycle ------------------------------------------------------
 
-func (s *Server) connect() error {
+func (s *Server) connect(consoleElevation bool) error {
 	if !s.cfg.IsVPNConfigValid() {
 		return errors.New("archivo .ovpn no configurado o inaccesible")
 	}
 	s.mu.Lock()
-	if s.manager != nil {
+	if s.manager != nil || s.connecting || s.stopping {
 		s.mu.Unlock()
-		return errors.New("ya hay una conexión activa")
+		return errors.New("ya hay una conexión activa o el daemon está cerrándose")
 	}
+	s.connecting = true
 	s.mu.Unlock()
 
 	openvpnPath, err := core.FindOpenVPN()
 	if err != nil {
+		s.mu.Lock()
+		s.connecting = false
+		s.mu.Unlock()
 		return err
 	}
 	s.log("Usando openvpn: " + openvpnPath)
 
-	mgr, err := core.Start(s.cfg.VPNConfigPath, openvpnPath)
+	mgr, err := core.StartWithConsoleElevation(s.cfg.VPNConfigPath, openvpnPath, consoleElevation)
 	if err != nil {
+		s.mu.Lock()
+		s.connecting = false
+		s.mu.Unlock()
 		return err
 	}
 
 	s.mu.Lock()
+	s.connecting = false
+	if s.stopping {
+		s.mu.Unlock()
+		mgr.Stop()
+		return errors.New("daemon está cerrándose")
+	}
 	s.manager = mgr
 	s.sendFns = mgr.SendFunctions()
 	s.mu.Unlock()

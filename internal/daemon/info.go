@@ -14,9 +14,10 @@ import (
 // encuentre: puerto local y cookie de autenticación. Se escribe en un lugar
 // convencional por OS y se borra al salir.
 type InfoFile struct {
-	Port  int
-	Token string
-	PID   int
+	Port       int
+	Token      string
+	PID        int
+	ConsoleTTY string
 }
 
 // infoPath devuelve la ruta al archivo de info del daemon según la plataforma.
@@ -63,7 +64,7 @@ func writeInfo(info InfoFile) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	contents := fmt.Sprintf("port=%d\ntoken=%s\npid=%d\n", info.Port, info.Token, info.PID)
+	contents := fmt.Sprintf("port=%d\ntoken=%s\npid=%d\nconsoleTTY=%s\n", info.Port, info.Token, info.PID, info.ConsoleTTY)
 	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
 		return "", err
 	}
@@ -98,6 +99,8 @@ func ReadInfo() (InfoFile, string, error) {
 			info.Token = val
 		case "pid":
 			info.PID, _ = strconv.Atoi(val)
+		case "consoleTTY":
+			info.ConsoleTTY = val
 		}
 	}
 	return info, path, nil

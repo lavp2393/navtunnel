@@ -15,13 +15,15 @@ type Envelope struct {
 // --- Comandos: cliente → daemon --------------------------------------------
 
 const (
-	CmdSubscribe         = "subscribe"         // iniciar el streaming de eventos
-	CmdConnect           = "connect"           // arrancar el Manager
-	CmdDisconnect        = "disconnect"        // detener el Manager
-	CmdSubmitCredential  = "submit-credential" // responder a ask-user/pass/otp
-	CmdSaveConfig        = "save-config"       // persistir .ovpn path
-	CmdShutdown          = "shutdown"          // terminar el daemon
-	CmdPing              = "ping"              // health check
+	CmdSubscribe        = "subscribe"         // iniciar el streaming de eventos
+	CmdConnect          = "connect"           // arrancar el Manager
+	CmdStatus           = "status"            // consultar si el Manager está activo
+	CmdShutdownIfIdle   = "shutdown-if-idle"  // detenerlo solo si no hay VPN activa
+	CmdDisconnect       = "disconnect"        // detener el Manager
+	CmdSubmitCredential = "submit-credential" // responder a ask-user/pass/otp
+	CmdSaveConfig       = "save-config"       // persistir .ovpn path
+	CmdShutdown         = "shutdown"          // terminar el daemon
+	CmdPing             = "ping"              // health check
 )
 
 // SubmitCredentialPayload acompaña a CmdSubmitCredential.
@@ -36,27 +38,33 @@ type SaveConfigPayload struct {
 	OvpnPath string `json:"ovpnPath"`
 }
 
+// ConnectPayload selects console-based sudo for an interactive CLI session.
+type ConnectPayload struct {
+	ConsoleElevation bool `json:"consoleElevation,omitempty"`
+}
+
 // --- Eventos: daemon → cliente ----------------------------------------------
 
 const (
-	EvtHello       = "hello"       // primer mensaje tras auth; informa versión.
-	EvtState       = "state"       // cambio de estado de OpenVPN.
-	EvtBytecount   = "bytecount"   // contadores rx/tx + rates.
-	EvtLog         = "log"         // línea de log.
-	EvtAskUser     = "ask-user"    // pide usuario.
-	EvtAskPass     = "ask-pass"    // pide password.
-	EvtAskOTP      = "ask-otp"     // pide OTP.
-	EvtConnected   = "connected"   // túnel ya activo.
-	EvtDisconnect  = "disconnected"// túnel caído / cerrado.
-	EvtAuthFailed  = "auth-failed" // credenciales rechazadas.
-	EvtFatal       = "fatal"       // error no recuperable.
-	EvtReply       = "reply"       // respuesta a un comando (ok/error).
+	EvtHello      = "hello"        // primer mensaje tras auth; informa versión.
+	EvtState      = "state"        // cambio de estado de OpenVPN.
+	EvtBytecount  = "bytecount"    // contadores rx/tx + rates.
+	EvtLog        = "log"          // línea de log.
+	EvtAskUser    = "ask-user"     // pide usuario.
+	EvtAskPass    = "ask-pass"     // pide password.
+	EvtAskOTP     = "ask-otp"      // pide OTP.
+	EvtConnected  = "connected"    // túnel ya activo.
+	EvtDisconnect = "disconnected" // túnel caído / cerrado.
+	EvtAuthFailed = "auth-failed"  // credenciales rechazadas.
+	EvtFatal      = "fatal"        // error no recuperable.
+	EvtReply      = "reply"        // respuesta a un comando (ok/error).
 )
 
 // HelloPayload se manda tras autenticar el socket.
 type HelloPayload struct {
-	Version  string `json:"version"`
-	OvpnPath string `json:"ovpnPath,omitempty"`
+	Version    string `json:"version"`
+	OvpnPath   string `json:"ovpnPath,omitempty"`
+	ConsoleTTY string `json:"consoleTTY,omitempty"`
 }
 
 // StatePayload describe el estado de conexión y metrics snapshot.
@@ -106,9 +114,10 @@ type DisconnectedPayload struct {
 
 // ReplyPayload es la respuesta a un comando del cliente.
 type ReplyPayload struct {
-	ID    string `json:"id,omitempty"`    // opcional, eco del CommandEnvelope.ID si se usa
-	OK    bool   `json:"ok"`
-	Error string `json:"error,omitempty"`
+	ID        string `json:"id,omitempty"` // opcional, eco del CommandEnvelope.ID si se usa
+	OK        bool   `json:"ok"`
+	Error     string `json:"error,omitempty"`
+	Connected bool   `json:"connected,omitempty"`
 }
 
 // CommandEnvelope extiende Envelope con un ID opcional para correlación.

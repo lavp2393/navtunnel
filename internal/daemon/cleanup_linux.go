@@ -20,7 +20,7 @@ import (
 // "navtunnel-mgmt-*". Buscamos la coincidencia estricta de ese flag y de
 // ese basename en el pw-file para no tocar procesos ajenos.
 const (
-	ovpnSignatureFlag   = "--management-hold"
+	ovpnSignatureFlag    = "--management-hold"
 	ovpnSignatureFilePfx = "navtunnel-mgmt-"
 )
 
@@ -67,6 +67,37 @@ func killOrphanOpenVPN() int {
 		time.Sleep(time.Second)
 	}
 	return killed
+}
+
+// hasManagedOpenVPN reports whether a NavTunnel-managed OpenVPN process is
+// running. If an OpenVPN process exists but its command line cannot be read,
+// return true conservatively so a legacy daemon is never stopped blindly.
+func hasManagedOpenVPN() bool {
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return true
+	}
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		if _, err := strconv.Atoi(e.Name()); err != nil {
+			continue
+		}
+		procDir := filepath.Join("/proc", e.Name())
+		data, err := os.ReadFile(filepath.Join(procDir, "cmdline"))
+		if err != nil {
+			comm, commErr := os.ReadFile(filepath.Join(procDir, "comm"))
+			if commErr == nil && strings.TrimSpace(string(comm)) == "openvpn" {
+				return true
+			}
+			continue
+		}
+		if looksLikeOurOpenVPN(strings.Split(string(data), "\x00")) {
+			return true
+		}
+	}
+	return false
 }
 
 // looksLikeOurOpenVPN chequea que el cmdline tenga nuestra firma: binario

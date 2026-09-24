@@ -16,8 +16,8 @@ func NewWindows() Platform {
 
 func (a *windowsAdapter) FindOpenVPN() (string, error) { return a.impl.FindOpenVPN() }
 func (a *windowsAdapter) RequiresElevation() bool      { return a.impl.RequiresElevation() }
-func (a *windowsAdapter) ElevateCommand(path string, args []string) (string, []string, error) {
-	return a.impl.ElevateCommand(path, args)
+func (a *windowsAdapter) ElevateCommand(path string, args []string, console bool) (string, []string, error) {
+	return a.impl.ElevateCommand(path, args, console)
 }
 func (a *windowsAdapter) GetConfigDir() string         { return a.impl.GetConfigDir() }
 func (a *windowsAdapter) GetDefaultConfigPath() string { return a.impl.GetDefaultConfigPath() }

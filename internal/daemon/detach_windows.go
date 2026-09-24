@@ -12,7 +12,7 @@ const isUnix = false
 
 // detachFromParent en Windows usa DETACHED_PROCESS + CREATE_NEW_PROCESS_GROUP
 // para que el hijo no comparta la consola del cliente ni muera con él.
-func detachFromParent(cmd *exec.Cmd) {
+func detachFromParent(cmd *exec.Cmd, _ bool) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		CreationFlags: 0x00000008 | 0x00000200, // DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
 	}

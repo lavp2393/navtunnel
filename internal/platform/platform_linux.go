@@ -16,8 +16,8 @@ func NewLinux() Platform {
 
 func (a *linuxAdapter) FindOpenVPN() (string, error) { return a.impl.FindOpenVPN() }
 func (a *linuxAdapter) RequiresElevation() bool      { return a.impl.RequiresElevation() }
-func (a *linuxAdapter) ElevateCommand(path string, args []string) (string, []string, error) {
-	return a.impl.ElevateCommand(path, args)
+func (a *linuxAdapter) ElevateCommand(path string, args []string, console bool) (string, []string, error) {
+	return a.impl.ElevateCommand(path, args, console)
 }
 func (a *linuxAdapter) GetConfigDir() string         { return a.impl.GetConfigDir() }
 func (a *linuxAdapter) GetDefaultConfigPath() string { return a.impl.GetDefaultConfigPath() }
